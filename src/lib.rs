@@ -19,6 +19,7 @@ pub mod network;
 pub mod node;
 pub mod p2p;
 pub mod script;
+pub mod silent;
 pub mod store;
 pub mod validate;
 pub mod verify;

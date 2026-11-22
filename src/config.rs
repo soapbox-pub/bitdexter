@@ -25,6 +25,9 @@ pub struct Config {
     pub assume_valid: bool,
     /// Serve Blockbook's API too, at `/websocket` and under `/api/v2`.
     pub blockbook: bool,
+    /// Serve silent payment tweaks too, as BlindBit Oracle does, under
+    /// `/blindbit`.
+    pub blindbit: bool,
     pub p2p: P2p,
 }
 
@@ -50,6 +53,7 @@ impl Default for Config {
             bulk_threshold: 1000,
             assume_valid: true,
             blockbook: false,
+            blindbit: false,
             p2p: P2p::default(),
         }
     }

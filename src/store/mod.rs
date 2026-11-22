@@ -367,6 +367,8 @@ pub struct Store {
     env: lmdb::Env,
     history: lmdb::Db,
     meta: lmdb::Db,
+    /// Silent payment tweaks, by block hash, as they're asked for.
+    tweaks: lmdb::Db,
     snapshot: RwLock<Snapshot>,
     /// Whether it's indexing in bulk, far behind the tip.
     syncing: AtomicBool,
@@ -534,6 +536,19 @@ impl Store {
             spendable: out.spendable,
             spent: out.spent.filter(|&by| by < txs).is_some(),
         })
+    }
+
+    /// A block's silent payment tweaks, if they've been computed.
+    pub fn cached_tweaks(&self, hash: &Hash) -> Result<Option<Vec<u8>>> {
+        let txn = self.env.read_txn()?;
+        Ok(txn.get(self.tweaks, hash)?.map(<[u8]>::to_vec))
+    }
+
+    pub fn cache_tweaks(&self, hash: &Hash, tweaks: &[u8]) -> Result<()> {
+        let mut txn = self.env.write_txn()?;
+        txn.put(self.tweaks, hash, tweaks, false)?;
+        txn.commit()?;
+        Ok(())
     }
 
     /// The median time past of block `height`, which must be committed.

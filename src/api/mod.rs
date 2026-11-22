@@ -1,6 +1,7 @@
 //! The HTTP APIs, each served at the root and under `/api`, as Esplora
 //! deployments usually are.
 
+pub mod blindbit;
 pub mod blockbook;
 pub mod esplora;
 
@@ -76,13 +77,22 @@ async fn status(axum::extract::State(state): axum::extract::State<AppState>) -> 
     }))
 }
 
-/// Esplora's API, at the root and under `/api`, and Blockbook's if
-/// `blockbook`.
-pub fn router(state: AppState, blockbook: bool) -> Router {
+/// Which APIs to serve besides Esplora's.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Extras {
+    pub blockbook: bool,
+    pub blindbit: bool,
+}
+
+/// Esplora's API, at the root and under `/api`, and the others asked for.
+pub fn router(state: AppState, extras: Extras) -> Router {
     let apis = esplora::router();
     let mut router = Router::new().route("/status", get(status)).merge(apis.clone()).nest("/api", apis);
-    if blockbook {
+    if extras.blockbook {
         router = router.merge(blockbook::router());
+    }
+    if extras.blindbit {
+        router = router.merge(blindbit::router());
     }
     router.with_state(state).layer(axum::middleware::from_fn(cors))
 }
@@ -99,12 +109,12 @@ async fn cors(request: axum::extract::Request, next: axum::middleware::Next) -> 
 pub async fn serve(
     addr: SocketAddr,
     state: AppState,
-    blockbook: bool,
+    extras: Extras,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("serving the API on http://{addr}");
-    axum::serve(listener, router(state, blockbook))
+    axum::serve(listener, router(state, extras))
         .with_graceful_shutdown(async move {
             let _ = shutdown.changed().await;
         })

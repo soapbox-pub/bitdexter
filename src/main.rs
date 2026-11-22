@@ -45,6 +45,9 @@ struct Args {
     /// Serve Blockbook's API too.
     #[arg(long)]
     blockbook: bool,
+    /// Serve silent payment tweaks too, as BlindBit Oracle does.
+    #[arg(long)]
+    blindbit: bool,
 }
 
 #[tokio::main]
@@ -78,6 +81,7 @@ async fn main() -> Result<()> {
         config.assume_valid = false;
     }
     config.blockbook |= args.blockbook;
+    config.blindbit |= args.blindbit;
 
     let dir = config.network_dir();
     tracing::info!("bitdexter {} on {}, in {}", env!("CARGO_PKG_VERSION"), config.network, dir.display());
@@ -107,7 +111,7 @@ async fn main() -> Result<()> {
     let api = tokio::spawn(bitdexter::api::serve(
         config.http,
         bitdexter::api::AppState { store, status, mempool, mempool_tx },
-        config.blockbook,
+        bitdexter::api::Extras { blockbook: config.blockbook, blindbit: config.blindbit },
         shutdown.clone(),
     ));
     node.run(shutdown).await?;

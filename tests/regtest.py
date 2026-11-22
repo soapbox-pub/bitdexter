@@ -14,6 +14,7 @@ bitcoind and bitcoin-cli must be on PATH.
 """
 
 import base64
+import hashlib
 import json
 import os
 import shutil
@@ -89,7 +90,7 @@ class Dexter:
             [
                 BITDEXTER, "--network", "regtest", "--data-dir", self.dir, "--http", f"127.0.0.1:{self.http}",
                 "--peer", f"127.0.0.1:{self.core.p2p}", "--connect-only",
-                "--bulk-threshold", str(self.bulk_threshold), "--blockbook",
+                "--bulk-threshold", str(self.bulk_threshold), "--blockbook", "--blindbit",
             ],
             stdout=self.log,
             stderr=self.log,
@@ -355,6 +356,93 @@ def check_blockbook(core, dexter):
     assert len(fees) == 4 and all(int(f["feePerUnit"]) >= 1000 for f in fees), fees
 
 
+# Just enough secp256k1 to check silent payment tweaks independently.
+P = 2**256 - 2**32 - 977
+N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+
+
+def point_add(a, b):
+    if a is None:
+        return b
+    if b is None:
+        return a
+    if a[0] == b[0] and (a[1] + b[1]) % P == 0:
+        return None
+    if a == b:
+        m = 3 * a[0] * a[0] * pow(2 * a[1], -1, P)
+    else:
+        m = (b[1] - a[1]) * pow(b[0] - a[0], -1, P)
+    x = (m * m - a[0] - b[0]) % P
+    return (x, (m * (a[0] - x) - a[1]) % P)
+
+
+def point_mul(point, k):
+    result = None
+    while k:
+        if k & 1:
+            result = point_add(result, point)
+        point = point_add(point, point)
+        k >>= 1
+    return result
+
+
+def lift(prefix, x):
+    y = pow((x**3 + 7) % P, (P + 1) // 4, P)
+    return (x, y if y % 2 == prefix % 2 else P - y)
+
+
+def compress(point):
+    return bytes([2 + point[1] % 2]) + point[0].to_bytes(32, "big")
+
+
+def tagged(tag, data):
+    t = hashlib.sha256(tag.encode()).digest()
+    return hashlib.sha256(t + t + data).digest()
+
+
+def expected_tweak(core, tx):
+    """A transaction's BIP352 tweak, from its P2WPKH and key-path P2TR
+    inputs, as Core describes them; None if it has others."""
+    total = None
+    for vin in tx["vin"]:
+        spk = vin["prevout"]["scriptPubKey"]["hex"]
+        witness = vin.get("txinwitness", [])
+        if spk.startswith("0014"):
+            key = bytes.fromhex(witness[-1])
+            total = point_add(total, lift(key[0], int.from_bytes(key[1:], "big")))
+        elif spk.startswith("5120") and len(witness) == 1:
+            total = point_add(total, lift(2, int(spk[4:], 16)))
+        else:
+            return None
+    outpoints = [bytes.fromhex(v["txid"])[::-1] + v["vout"].to_bytes(4, "little") for v in tx["vin"]]
+    input_hash = int.from_bytes(tagged("BIP0352/Inputs", min(outpoints) + compress(total)), "big")
+    return compress(point_mul(total, input_hash)).hex()
+
+
+def check_blindbit(core, dexter):
+    """Checks silent payment tweaks against ones worked out here."""
+    tip = core.cli("getblockcount")
+    assert dexter.get("/blindbit/info")["height"] == tip
+    checked = 0
+    for height in range(tip - 5, tip + 1):
+        block = core.cli("getblock", core.cli("getblockhash", height), 3)
+        expected = []
+        for tx in block["tx"][1:]:
+            if any(o["scriptPubKey"]["hex"].startswith("5120") and len(o["scriptPubKey"]["hex"]) == 68 for o in tx["vout"]):
+                tweak = expected_tweak(core, tx)
+                if tweak is not None:
+                    expected.append(tweak)
+        ours = dexter.get(f"/blindbit/tweaks/{height}")
+        # Ours may have more, from inputs this check doesn't work out.
+        assert set(expected) <= set(ours), (height, expected, ours)
+        assert dexter.get(f"/blindbit/tweaks/{height}") == ours
+        checked += len(expected)
+        utxos = dexter.get(f"/blindbit/utxos/{height}")
+        assert all(u["scriptpubkey"].startswith("5120") and u["block_height"] == height for u in utxos)
+    assert checked > 0
+    print(f"  checked {checked} silent payment tweaks")
+
+
 def scenario(bulk_threshold):
     tmp = tempfile.mkdtemp(prefix="bitdexter-regtest-")
     core = Core(tmp)
@@ -372,6 +460,9 @@ def scenario(bulk_threshold):
 
         print("Blockbook's API")
         check_blockbook(core, dexter)
+
+        print("silent payments")
+        check_blindbit(core, dexter)
 
         print("reorganizing")
         tip = core.cli("getblockcount")

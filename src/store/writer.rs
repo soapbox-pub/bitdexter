@@ -47,6 +47,7 @@ impl Writer {
         let env = lmdb::Env::open(&dir.join("index"), 1 << 40, 4)?;
         let history = env.create_db("history", true)?;
         let meta = env.create_db("meta", false)?;
+        let tweaks = env.create_db("tweaks", false)?;
         let state = {
             let txn = env.read_txn()?;
             match txn.get(meta, b"state")? {
@@ -87,6 +88,7 @@ impl Writer {
             env,
             history,
             meta,
+            tweaks,
             snapshot: RwLock::new(state.published),
             syncing: AtomicBool::new(state.mode != Mode::Tip),
             first_txs: RwLock::new(first_txs),
