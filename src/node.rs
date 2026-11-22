@@ -18,24 +18,27 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use bitcoin::BlockHash;
 use bitcoin::block::Header;
 use bitcoin::hashes::Hash as _;
 use bitcoin::p2p::message::NetworkMessage;
 use bitcoin::p2p::message_blockdata::{GetHeadersMessage, Inventory};
-use bitcoin::BlockHash;
 use tokio::sync::mpsc;
 
 use crate::chain::{HeaderChain, HeaderError};
 use crate::indexer;
 use crate::network::Chain;
 use crate::p2p::addrman::AddrMan;
-use crate::p2p::{run_peer, PeerEvent, PeerId, PeerInfo};
+use crate::p2p::{PeerEvent, PeerId, PeerInfo, run_peer};
 use crate::store::Writer;
 
-/// Blocks asked of one peer at a time.
-const MAX_IN_FLIGHT: usize = 16;
+/// Blocks asked of one peer at a time: enough for about this many bytes,
+/// between these bounds, so that small blocks don't leave the link idle.
+const IN_FLIGHT_BYTES: f64 = 8e6;
+const MIN_IN_FLIGHT: usize = 16;
+const MAX_IN_FLIGHT: usize = 512;
 /// How far past the last block handed to the indexer blocks are requested.
-const WINDOW: u32 = 1024;
+const WINDOW: u32 = 8192;
 /// The most bytes of blocks held waiting for those before them.
 const MAX_BUFFERED: usize = 512 << 20;
 /// Blocks handed to the indexer and not yet indexed, at most.
@@ -114,6 +117,11 @@ pub struct Node {
     status: Arc<Mutex<Status>>,
     last_log: Instant,
     best_changed: bool,
+    /// The lowest height that may not have been requested yet.
+    request_from: u32,
+    /// A moving average of the size of blocks received.
+    avg_block: f64,
+    last_upkeep: Instant,
     indexer_thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -176,6 +184,9 @@ impl Node {
             status,
             last_log: Instant::now(),
             best_changed: true,
+            request_from: 0,
+            avg_block: 1000.0,
+            last_upkeep: Instant::now() - Duration::from_secs(1),
             indexer_thread: Some(indexer_thread),
         })
     }
@@ -185,11 +196,7 @@ impl Node {
         loop {
             tokio::select! {
                 Some(event) = self.events.recv() => self.on_peer_event(event),
-                Some(event) = self.indexer.recv() => {
-                    if let Err(err) = self.on_indexer_event(event) {
-                        return Err(err);
-                    }
-                }
+                Some(event) = self.indexer.recv() => self.on_indexer_event(event)?,
                 Some(addrs) = self.addrs.recv() => {
                     self.seeding = false;
                     for addr in addrs {
@@ -252,6 +259,7 @@ impl Node {
                     for hash in peer.in_flight {
                         self.requested.remove(&hash);
                     }
+                    self.request_from = 0;
                 }
                 if self.header_sync == Some(id) {
                     self.header_sync = None;
@@ -266,6 +274,7 @@ impl Node {
             for hash in peer.in_flight {
                 self.requested.remove(&hash);
             }
+            self.request_from = 0;
             // Dropping its command channel ends its task, which reports it.
         }
         if self.header_sync == Some(id) {
@@ -284,7 +293,8 @@ impl Node {
         if let Some(peer) = self.peers.get_mut(&id) {
             peer.headers_asked = Some(Instant::now());
             peer.last_headers_poll = Instant::now();
-            let _ = peer.commands.send(NetworkMessage::GetHeaders(GetHeadersMessage::new(locator, BlockHash::all_zeros())));
+            let _ =
+                peer.commands.send(NetworkMessage::GetHeaders(GetHeadersMessage::new(locator, BlockHash::all_zeros())));
         }
     }
 
@@ -324,6 +334,7 @@ impl Node {
                             // It doesn't have it, so it's not as far along as it said.
                             peer.height = peer.height.min(request.height.saturating_sub(1));
                         }
+                        self.request_from = 0;
                     }
                 }
             }
@@ -383,6 +394,7 @@ impl Node {
         if let Some(peer) = self.peers.get_mut(&request.peer) {
             peer.in_flight.remove(&hash);
         }
+        self.avg_block = self.avg_block * 0.95 + bytes.len() as f64 * 0.05;
         let next = self.sent.len() as u32;
         if request.height >= next && self.headers.at(request.height).is_some_and(|e| e.hash == hash) {
             self.received_bytes += bytes.len();
@@ -411,6 +423,7 @@ impl Node {
                 }
                 self.sent.truncate(height as usize);
                 self.sent_from.retain(|&h, _| h < height);
+                self.request_from = 0;
             }
             indexer::Event::Failed(err) => anyhow::bail!("the indexer failed: {err}"),
         }
@@ -421,13 +434,17 @@ impl Node {
 
     /// Everything the node does between events.
     fn step(&mut self) {
-        self.maintain_peers();
-        self.sync_headers();
+        if self.last_upkeep.elapsed() >= Duration::from_millis(250) {
+            self.last_upkeep = Instant::now();
+            self.maintain_peers();
+            self.sync_headers();
+            self.time_out_requests();
+        }
         if self.best_changed {
             self.best_changed = false;
             self.follow_best_chain();
+            self.request_from = 0;
         }
-        self.time_out_requests();
         self.request_blocks();
         self.hand_over();
         let mut status = self.status.lock().unwrap();
@@ -488,7 +505,8 @@ impl Node {
     fn sync_headers(&mut self) {
         let tip = self.headers.tip_height();
         if let Some(id) = self.header_sync {
-            let stalled = self.peers.get(&id).is_none_or(|p| p.headers_asked.is_some_and(|at| at.elapsed() > HEADERS_TIMEOUT));
+            let stalled =
+                self.peers.get(&id).is_none_or(|p| p.headers_asked.is_some_and(|at| at.elapsed() > HEADERS_TIMEOUT));
             if stalled {
                 self.disconnect(id, "too slow to send headers");
             } else {
@@ -497,7 +515,8 @@ impl Node {
         }
         // One peer at a time while catching up; then ask each now and then,
         // in case an announcement was missed.
-        let ahead = self.peers.iter().filter(|(_, p)| p.height > tip && p.headers_asked.is_none()).map(|(&id, _)| id).next();
+        let ahead =
+            self.peers.iter().filter(|(_, p)| p.height > tip && p.headers_asked.is_none()).map(|(&id, _)| id).next();
         if let Some(id) = ahead {
             self.header_sync = Some(id);
             self.ask_headers(id);
@@ -542,8 +561,8 @@ impl Node {
 
     fn time_out_requests(&mut self) {
         let next = self.sent.len() as u32;
-        let window_full = self.received_bytes >= MAX_BUFFERED
-            || self.requested.len() + self.received.len() >= WINDOW as usize;
+        let window_full =
+            self.received_bytes >= MAX_BUFFERED || self.requested.len() + self.received.len() >= WINDOW as usize;
         let mut slow = Vec::new();
         for (hash, request) in &self.requested {
             let age = request.at.elapsed();
@@ -562,11 +581,21 @@ impl Node {
         if let Some(stop) = self.config.stop_height {
             last = last.min(stop);
         }
-        if next > last || self.received_bytes >= MAX_BUFFERED {
+        if next > last {
             return;
         }
+        // With the buffer full, only the blocks the indexer needs soonest
+        // are asked for: they must be, or nothing would ever free it.
+        let in_flight_bytes = self.requested.len() as f64 * self.avg_block;
+        let full = self.received_bytes as f64 + in_flight_bytes >= MAX_BUFFERED as f64;
+        let max_in_flight = ((IN_FLIGHT_BYTES / self.avg_block) as usize).clamp(MIN_IN_FLIGHT, MAX_IN_FLIGHT);
         let mut asks: HashMap<PeerId, Vec<Inventory>> = HashMap::new();
-        for height in next..=last {
+        let start = if full { next } else { self.request_from.max(next) };
+        for height in start..=last {
+            if full && height >= next + MIN_IN_FLIGHT as u32 {
+                break;
+            }
+            self.request_from = self.request_from.max(height);
             if self.received.contains_key(&height) {
                 continue;
             }
@@ -577,13 +606,16 @@ impl Node {
             let peer = self
                 .peers
                 .iter()
-                .filter(|(_, p)| p.height >= height && p.in_flight.len() < MAX_IN_FLIGHT)
+                .filter(|(_, p)| p.height >= height && p.in_flight.len() < max_in_flight)
                 .min_by_key(|(_, p)| p.in_flight.len())
                 .map(|(&id, _)| id);
             let Some(id) = peer else { break };
             self.peers.get_mut(&id).unwrap().in_flight.insert(hash);
             self.requested.insert(hash, Request { peer: id, height, at: Instant::now() });
             asks.entry(id).or_default().push(Inventory::WitnessBlock(hash));
+            if !full {
+                self.request_from = height + 1;
+            }
         }
         for (id, inventory) in asks {
             self.send(id, NetworkMessage::GetData(inventory));
