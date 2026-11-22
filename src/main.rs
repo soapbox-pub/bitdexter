@@ -36,6 +36,9 @@ struct Args {
     /// Stop indexing at this height.
     #[arg(long)]
     stop_height: Option<u32>,
+    /// Index in bulk when more than this many blocks behind.
+    #[arg(long)]
+    bulk_threshold: Option<u32>,
 }
 
 #[tokio::main]
@@ -62,6 +65,9 @@ async fn main() -> Result<()> {
     if args.stop_height.is_some() {
         config.p2p.stop_height = args.stop_height;
     }
+    if let Some(threshold) = args.bulk_threshold {
+        config.bulk_threshold = threshold;
+    }
 
     let dir = config.network_dir();
     tracing::info!("bitdexter {} on {}, in {}", env!("CARGO_PKG_VERSION"), config.network, dir.display());
@@ -74,6 +80,7 @@ async fn main() -> Result<()> {
         connect_only: config.p2p.connect_only,
         max_peers: config.p2p.max_peers,
         stop_height: config.p2p.stop_height,
+        bulk_threshold: config.bulk_threshold,
     };
     let node = Node::new(node_config, &dir, writer, status.clone())?;
 

@@ -190,6 +190,19 @@ impl Txn<'_> {
     }
 }
 
+impl Txn<'_> {
+    /// Calls `f` with every entry of `db`, each value of a key in turn.
+    pub fn for_each(&self, db: Db, mut f: impl FnMut(&[u8], &[u8]) -> anyhow::Result<()>) -> anyhow::Result<()> {
+        let mut cursor = self.cursor(db)?;
+        let mut entry = cursor.first()?;
+        while let Some((key, value)) = entry {
+            f(key, value)?;
+            entry = cursor.next()?;
+        }
+        Ok(())
+    }
+}
+
 impl Drop for Txn<'_> {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
@@ -265,6 +278,15 @@ impl<'t> Cursor<'t> {
         // SAFETY: a live cursor; returned slices live as long as the transaction.
         let hit = found(unsafe { ffi::mdb_cursor_get(self.ptr, &mut k, &mut v, op) })?;
         Ok(hit.then(|| unsafe { (bytes(&k), bytes(&v)) }))
+    }
+
+    pub fn first(&mut self) -> Result<Option<Entry<'t>>> {
+        self.op(None, ffi::MDB_FIRST)
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> Result<Option<Entry<'t>>> {
+        self.op(None, ffi::MDB_NEXT)
     }
 
     pub fn set(&mut self, key: &[u8]) -> Result<Option<Entry<'t>>> {

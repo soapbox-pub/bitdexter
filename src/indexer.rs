@@ -1,8 +1,10 @@
 //! The thread that indexes blocks, in order, as the node hands them over.
 //!
-//! It commits whenever it has nothing waiting, so a block at the tip is
-//! visible as soon as it's indexed, and during initial sync every ten
-//! seconds or so (see [`Writer::should_commit`]).
+//! More than `bulk_threshold` blocks behind the height the node's syncing
+//! to, it indexes in bulk (see [`crate::store::bulk`]), and merges what it's
+//! indexed once it's caught up, or before taking blocks off in a reorg.
+//! Otherwise it indexes in place, and commits whenever it has nothing
+//! waiting, so a block at the tip is visible as soon as it's indexed.
 
 use std::time::{Duration, Instant};
 
@@ -14,16 +16,14 @@ use crate::block::parse_block;
 use crate::store::{ConnectError, Writer};
 use crate::validate::check_block;
 
+/// How close to the target indexing in bulk must get before it's merged.
+const CAUGHT_UP: u32 = 6;
+
 pub enum Command {
-    Connect {
-        height: u32,
-        hash: BlockHash,
-        bytes: Vec<u8>,
-    },
+    /// Index a block. `target` is the height the node's syncing to.
+    Connect { height: u32, hash: BlockHash, bytes: Vec<u8>, target: u32 },
     /// Disconnect blocks until `height` is the tip.
-    Rewind {
-        height: u32,
-    },
+    Rewind { height: u32 },
 }
 
 pub enum Event {
@@ -66,6 +66,7 @@ struct Progress {
 
 pub fn spawn(
     mut writer: Writer,
+    bulk_threshold: u32,
     mut commands: mpsc::UnboundedReceiver<Command>,
     events: mpsc::UnboundedSender<Event>,
 ) -> std::thread::JoinHandle<()> {
@@ -73,10 +74,19 @@ pub fn spawn(
         .name("indexer".into())
         .spawn(move || {
             let mut progress = Progress { since: Instant::now(), blocks: 0, txs: 0, bytes: 0 };
+            let mut target = 0u32;
             loop {
                 let command = match commands.try_recv() {
                     Ok(command) => command,
                     Err(mpsc::error::TryRecvError::Empty) => {
+                        let tip = writer.next_height().saturating_sub(1);
+                        if writer.in_bulk()
+                            && target.saturating_sub(tip) <= CAUGHT_UP
+                            && let Err(err) = writer.finish_bulk()
+                        {
+                            let _ = events.send(Event::Failed(format!("merging: {err:#}")));
+                            return;
+                        }
                         if let Err(err) = writer.commit() {
                             let _ = events.send(Event::Failed(format!("committing: {err:#}")));
                             return;
@@ -89,10 +99,18 @@ pub fn spawn(
                     Err(mpsc::error::TryRecvError::Disconnected) => break,
                 };
                 match command {
-                    Command::Connect { height, hash, bytes } => {
+                    Command::Connect { height, hash, bytes, target: to } => {
+                        target = to;
                         if height != writer.next_height() {
                             // Sent before a block it builds on was rejected.
                             continue;
+                        }
+                        if !writer.in_bulk()
+                            && target.saturating_sub(height) > bulk_threshold
+                            && let Err(err) = writer.begin_bulk()
+                        {
+                            let _ = events.send(Event::Failed(format!("starting bulk indexing: {err:#}")));
+                            return;
                         }
                         match connect(&mut writer, height, hash, &bytes, &mut progress) {
                             Ok(()) => {

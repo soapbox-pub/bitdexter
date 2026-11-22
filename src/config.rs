@@ -17,6 +17,9 @@ pub struct Config {
     pub data_dir: Option<PathBuf>,
     /// Where the HTTP API listens.
     pub http: SocketAddr,
+    /// Index in bulk, merging once caught up, when more than this many
+    /// blocks behind.
+    pub bulk_threshold: u32,
     pub p2p: P2p,
 }
 
@@ -35,7 +38,13 @@ pub struct P2p {
 
 impl Default for Config {
     fn default() -> Config {
-        Config { network: Chain::Mainnet, data_dir: None, http: ([127, 0, 0, 1], 3000).into(), p2p: P2p::default() }
+        Config {
+            network: Chain::Mainnet,
+            data_dir: None,
+            http: ([127, 0, 0, 1], 3000).into(),
+            bulk_threshold: 1000,
+            p2p: P2p::default(),
+        }
     }
 }
 

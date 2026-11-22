@@ -66,6 +66,7 @@ async fn status(axum::extract::State(state): axum::extract::State<AppState>) -> 
         "peers": status.peers,
         "headers": status.headers,
         "indexed": status.indexed,
+        "syncing": state.store.syncing(),
         "disk_usage": usage,
     }))
 }

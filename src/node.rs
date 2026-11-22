@@ -63,6 +63,8 @@ pub struct NodeConfig {
     pub max_peers: usize,
     /// Don't index past this height.
     pub stop_height: Option<u32>,
+    /// Index in bulk when more than this many blocks behind.
+    pub bulk_threshold: u32,
 }
 
 /// What the node's doing, for whoever asks.
@@ -147,7 +149,7 @@ impl Node {
         let (addrs_tx, addrs) = mpsc::unbounded_channel();
         let (indexer_tx, indexer_rx) = mpsc::unbounded_channel();
         let (indexer_events_tx, indexer_events) = mpsc::unbounded_channel();
-        let indexer_thread = indexer::spawn(writer, indexer_rx, indexer_events_tx);
+        let indexer_thread = indexer::spawn(writer, config.bulk_threshold, indexer_rx, indexer_events_tx);
         let addrman = AddrMan::load(data_dir.join("peers.txt"));
         tracing::info!("{} headers known, to height {}; {} indexed", headers.len(), headers.tip_height(), sent.len());
         // The genesis block needn't be downloaded.
@@ -634,7 +636,11 @@ impl Node {
             self.received_bytes -= bytes.len();
             self.sent.push(hash);
             self.sent_from.insert(next, from);
-            let _ = self.indexer_tx.send(indexer::Command::Connect { height: next, hash, bytes });
+            let mut target = self.headers.tip_height();
+            if let Some(stop) = self.config.stop_height {
+                target = target.min(stop);
+            }
+            let _ = self.indexer_tx.send(indexer::Command::Connect { height: next, hash, bytes, target });
         }
     }
 }

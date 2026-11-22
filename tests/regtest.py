@@ -4,7 +4,9 @@
 Starts bitcoind, makes a chain with every common kind of output and spend,
 syncs bitdexter from it over P2P, and checks every block, transaction and
 wallet UTXO bitdexter serves against what bitcoind says. Then reorganizes
-the chain and checks again, and restarts bitdexter and checks again.
+the chain and checks again, and restarts bitdexter and checks again. It
+does it all twice: indexing in place, and indexing in bulk, with a low
+enough threshold that both the first sync and a catch-up go in bulk.
 
     tests/regtest.py [path/to/bitdexter]
 
@@ -72,7 +74,8 @@ class Core:
 
 
 class Dexter:
-    def __init__(self, tmp, core):
+    def __init__(self, tmp, core, bulk_threshold):
+        self.bulk_threshold = bulk_threshold
         self.dir = os.path.join(tmp, "dexter")
         self.http = free_port()
         self.core = core
@@ -84,6 +87,7 @@ class Dexter:
             [
                 BITDEXTER, "--network", "regtest", "--data-dir", self.dir, "--http", f"127.0.0.1:{self.http}",
                 "--peer", f"127.0.0.1:{self.core.p2p}", "--connect-only",
+                "--bulk-threshold", str(self.bulk_threshold),
             ],
             stdout=self.log,
             stderr=self.log,
@@ -204,10 +208,10 @@ def check(core, dexter):
     print(f"  checked {tip + 1} blocks, {txs} transactions, {len(by_address)} addresses")
 
 
-def main():
+def scenario(bulk_threshold):
     tmp = tempfile.mkdtemp(prefix="bitdexter-regtest-")
     core = Core(tmp)
-    dexter = Dexter(tmp, core)
+    dexter = Dexter(tmp, core, bulk_threshold)
     try:
         print("making a chain")
         make_chain(core, 40)
@@ -229,13 +233,12 @@ def main():
 
         print("killing mid-sync and recovering")
         dexter.stop(signal.SIGKILL)
-        make_chain(core, 5)
+        make_chain(core, 25)
         dexter.start()
         time.sleep(0.5)
         dexter.stop(signal.SIGKILL)
         dexter.start()
         check(core, dexter)
-        print("ok")
     finally:
         if dexter.proc and dexter.proc.poll() is None:
             dexter.stop()
@@ -244,6 +247,14 @@ def main():
             shutil.rmtree(tmp)
         else:
             print(f"kept {tmp}")
+
+
+def main():
+    print("== indexing in place")
+    scenario(1_000_000)
+    print("== indexing in bulk")
+    scenario(10)
+    print("ok")
 
 
 if __name__ == "__main__":
