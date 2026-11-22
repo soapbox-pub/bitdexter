@@ -1,0 +1,94 @@
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
+use anyhow::Result;
+use clap::Parser;
+
+use bitdexter::config::Config;
+use bitdexter::network::Chain;
+use bitdexter::node::{Node, NodeConfig, Status};
+use bitdexter::store::Store;
+
+/// A Bitcoin indexer that syncs over P2P and serves an Esplora-compatible
+/// API.
+#[derive(Parser)]
+#[command(version)]
+struct Args {
+    /// The config file; by default ~/.config/bitdexter/bitdexter.toml, if
+    /// it's there.
+    #[arg(long)]
+    config: Option<PathBuf>,
+    /// mainnet, testnet4, signet or regtest.
+    #[arg(long)]
+    network: Option<Chain>,
+    /// Where the index is kept, in a directory per network.
+    #[arg(long)]
+    data_dir: Option<PathBuf>,
+    /// Where the HTTP API listens.
+    #[arg(long)]
+    http: Option<std::net::SocketAddr>,
+    /// A peer to keep connected, as host:port. May be given more than once.
+    #[arg(long = "peer")]
+    peers: Vec<String>,
+    /// Connect only to the peers given.
+    #[arg(long)]
+    connect_only: bool,
+    /// Stop indexing at this height.
+    #[arg(long)]
+    stop_height: Option<u32>,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
+    let args = Args::parse();
+    let mut config = Config::load(args.config.as_deref())?;
+    if let Some(network) = args.network {
+        config.network = network;
+    }
+    if let Some(dir) = args.data_dir {
+        config.data_dir = Some(dir);
+    }
+    if let Some(http) = args.http {
+        config.http = http;
+    }
+    config.p2p.peers.extend(args.peers);
+    config.p2p.connect_only |= args.connect_only;
+    if args.stop_height.is_some() {
+        config.p2p.stop_height = args.stop_height;
+    }
+
+    let dir = config.network_dir();
+    tracing::info!("bitdexter {} on {}, in {}", env!("CARGO_PKG_VERSION"), config.network, dir.display());
+    let writer = Store::open(&dir, config.network)?;
+    let store = writer.store.clone();
+    let status = Arc::new(Mutex::new(Status::default()));
+    let node_config = NodeConfig {
+        chain: config.network,
+        peers: config.resolve_peers()?,
+        connect_only: config.p2p.connect_only,
+        max_peers: config.p2p.max_peers,
+        stop_height: config.p2p.stop_height,
+    };
+    let node = Node::new(node_config, &dir, writer, status.clone())?;
+
+    let (shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("shutting down");
+        let _ = shutdown_tx.send(true);
+    });
+    let api = tokio::spawn(bitdexter::api::serve(
+        config.http,
+        bitdexter::api::AppState { store, status },
+        shutdown.clone(),
+    ));
+    node.run(shutdown).await?;
+    api.abort();
+    Ok(())
+}
