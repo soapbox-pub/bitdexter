@@ -32,6 +32,7 @@ http = "127.0.0.1:3000"
 bulk_threshold = 1000          # index in bulk when this many blocks behind
 assume_valid = true            # skip scripts up to the assumevalid block
 blockbook = false              # serve Blockbook's API too
+blindbit = false               # serve silent payment tweaks too
 
 [p2p]
 peers = []                     # always kept connected, as host:port
@@ -74,6 +75,16 @@ forms) or an output descriptor of one: `pkh()`, `sh(wpkh())`, `wpkh()` or
 and change addresses are derived in turn until 20 in a row are unused, and
 their history, balances and UTXOs, unconfirmed too, given at once. Fiat rates
 (`getCurrentFiatRates`) and subscriptions aren't served yet.
+
+### Silent payments
+
+With `blindbit = true` (or `--blindbit`), it serves BIP352 tweaks as
+[BlindBit Oracle](https://github.com/setavenger/blindbit-oracle) does, under
+`/blindbit`: `/info`, `/tweaks/:height` (each eligible transaction's
+`input_hash·A`, 33 bytes) and `/utxos/:height` (their taproot outputs, and
+whether each is spent). A block's tweaks are computed the first time they're
+asked for, from mainnet's taproot activation on, and kept, by block hash, in
+LMDB. They match BIP352's test vectors.
 
 ## Mempool
 
@@ -176,7 +187,7 @@ Not yet: signet's block signatures, and a minimum chain work for header sync.
 2. ~~Script verification~~ Done.
 3. ~~Mempool~~ Done.
 4. ~~Blockbook's API~~ Done, but for fiat rates and subscriptions.
-5. **Silent payments**: BIP352 tweaks, served as BlindBit Oracle serves them.
+5. ~~Silent payments~~ Done.
 6. Prices for `/v1/prices`, the Electrum protocol, and packages.
 
 ## Testing
