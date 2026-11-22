@@ -5,11 +5,11 @@ peer-to-peer network, keeps it in a compact format of its own, and serves an
 [Esplora](https://github.com/Blockstream/esplora/blob/master/API.md)-compatible
 API. No Bitcoin Core node is needed: it's one program and one data directory.
 
-**Status: early.** It syncs mainnet, testnet4, signet and regtest from peers, follows
-reorgs, survives crashes, and serves Esplora's read API for blocks, transactions
-and addresses, matching Bitcoin Core and mempool.space byte for byte where tested.
-It has no mempool yet, so no broadcasting or fee estimates: see
-[Roadmap](#roadmap).
+**Status: early.** It syncs mainnet, testnet4, signet and regtest from peers,
+validates as Bitcoin Core does, follows reorgs, survives crashes, keeps a
+mempool, and serves Esplora's API for blocks, transactions, addresses,
+broadcasting and fee estimates, matching Bitcoin Core and mempool.space where
+tested. See [Roadmap](#roadmap) for what's next.
 
 ## Running
 
@@ -49,9 +49,30 @@ The Esplora endpoints served so far:
 | Blocks | `/blocks/tip/height`, `/blocks/tip/hash`, `/blocks[/:start_height]`, `/block-height/:height`, `/block/:hash`, `/block/:hash/header`, `/block/:hash/status`, `/block/:hash/txids`, `/block/:hash/txs[/:start_index]`, `/block/:hash/txid/:index`, `/block/:hash/raw` |
 | Transactions | `/tx/:txid`, `/tx/:txid/hex`, `/tx/:txid/raw`, `/tx/:txid/status`, `/tx/:txid/outspend/:vout`, `/tx/:txid/outspends`, `/tx/:txid/merkle-proof`, `/tx/:txid/merkleblock-proof` |
 | Addresses | `/address/:address`, `/address/:address/txs`, `/address/:address/txs/chain[/:last_seen_txid]`, `/address/:address/txs/mempool`, `/address/:address/utxo`, and the same under `/scripthash/:hash` |
+| Mempool | `POST /tx`, `/mempool`, `/mempool/txids`, `/mempool/recent`, `/fee-estimates`, and mempool.space's `/v1/fees/recommended` |
 
-Still to come: `POST /tx`, `/fee-estimates`, `/mempool*` and mempool stats,
-which need a mempool, and mempool.space's `/v1/prices`.
+Unconfirmed transactions are served by `/tx/:txid` and the rest, and counted
+in addresses' `mempool_stats`, transactions and UTXOs, as Esplora does.
+
+Still to come: mempool.space's `/v1/prices`.
+
+## Mempool
+
+Transactions peers announce are fetched once the first sync is done, and kept
+if they'd be valid in the next block: their inputs exist and are unspent (in
+the chain or the mempool), coinbases mature, lock times passed, sigops few
+enough, scripts verified, paying at least 0.1 sat/vB. A transaction spending
+what one in the mempool spends replaces it, and what spends it, if it pays
+more in all, by 0.1 sat/vB of its size, and at a higher rate (full RBF, as
+Bitcoin Core's default). Those whose inputs aren't known are dropped, not
+kept as orphans. `POST /tx` checks a transaction the same way and sends it to
+every peer, again every ten minutes until it's confirmed; a refusal comes as
+electrs gives bitcoind's, `sendrawtransaction RPC error: {"code":…,"message":…}`.
+
+Fee estimates come from the mempool: its transactions, highest rate first,
+fill blocks in turn, and the estimate for a target of n blocks is the lowest
+rate in the n-th, or 1 sat/vB if they don't fill that many. The mempool isn't
+saved when bitdexter stops; it fills again from what peers announce.
 
 ## How it's stored
 
@@ -134,8 +155,7 @@ Not yet: signet's block signatures, and a minimum chain work for header sync.
 
 1. ~~Initial sync in bulk.~~ Done.
 2. ~~Script verification~~ Done.
-3. **Mempool**: transaction relay, `POST /tx`, `/fee-estimates`, `/mempool*`,
-   unconfirmed history and balances.
+3. ~~Mempool~~ Done.
 4. **Blockbook's API**, optionally: REST and WebSocket, xpub and descriptor
    scans (`getAccountInfo`, `getAccountUtxo`, `estimateFee`,
    `sendTransaction`, …).
