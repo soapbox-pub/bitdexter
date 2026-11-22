@@ -28,6 +28,9 @@ pub struct Config {
     /// Serve silent payment tweaks too, as BlindBit Oracle does, under
     /// `/blindbit`.
     pub blindbit: bool,
+    /// Fetch the price of bitcoin from exchanges every minute, for
+    /// `/v1/prices` and Blockbook's fiat rates.
+    pub prices: bool,
     pub p2p: P2p,
 }
 
@@ -54,6 +57,7 @@ impl Default for Config {
             assume_valid: true,
             blockbook: false,
             blindbit: false,
+            prices: false,
             p2p: P2p::default(),
         }
     }

@@ -33,6 +33,7 @@ bulk_threshold = 1000          # index in bulk when this many blocks behind
 assume_valid = true            # skip scripts up to the assumevalid block
 blockbook = false              # serve Blockbook's API too
 blindbit = false               # serve silent payment tweaks too
+prices = false                 # fetch prices from exchanges for /v1/prices
 
 [p2p]
 peers = []                     # always kept connected, as host:port
@@ -57,7 +58,11 @@ The Esplora endpoints served so far:
 Unconfirmed transactions are served by `/tx/:txid` and the rest, and counted
 in addresses' `mempool_stats`, transactions and UTXOs, as Esplora does.
 
-Still to come: mempool.space's `/v1/prices`.
+With `prices = true` (or `--prices`), it fetches the price of bitcoin from
+Coinbase's and Kraken's public tickers every minute and serves the median as
+mempool.space's `/v1/prices` does (and Blockbook's `getCurrentFiatRates`).
+Otherwise `/v1/prices` answers 404, which wallets take as a reason to ask
+another server.
 
 ### Blockbook
 
@@ -73,8 +78,8 @@ An account is an extended public key (xpub, ypub or zpub, or their testnet
 forms) or an output descriptor of one: `pkh()`, `sh(wpkh())`, `wpkh()` or
 `tr()`, with or without its key origin, `/<0;1>/*` and checksum. Its receive
 and change addresses are derived in turn until 20 in a row are unused, and
-their history, balances and UTXOs, unconfirmed too, given at once. Fiat rates
-(`getCurrentFiatRates`) and subscriptions aren't served yet.
+their history, balances and UTXOs, unconfirmed too, given at once. Historical fiat
+rates and subscriptions aren't served yet.
 
 ### Silent payments
 
@@ -188,7 +193,9 @@ Not yet: signet's block signatures, and a minimum chain work for header sync.
 3. ~~Mempool~~ Done.
 4. ~~Blockbook's API~~ Done, but for fiat rates and subscriptions.
 5. ~~Silent payments~~ Done.
-6. Prices for `/v1/prices`, the Electrum protocol, and packages.
+6. ~~Prices~~ Done.
+7. A full mainnet sync measured end to end; faster downloads from peers.
+8. The Electrum protocol, and packages.
 
 ## Testing
 

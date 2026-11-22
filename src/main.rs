@@ -48,6 +48,9 @@ struct Args {
     /// Serve silent payment tweaks too, as BlindBit Oracle does.
     #[arg(long)]
     blindbit: bool,
+    /// Fetch the price of bitcoin from exchanges, for `/v1/prices`.
+    #[arg(long)]
+    prices: bool,
 }
 
 #[tokio::main]
@@ -82,6 +85,7 @@ async fn main() -> Result<()> {
     }
     config.blockbook |= args.blockbook;
     config.blindbit |= args.blindbit;
+    config.prices |= args.prices;
 
     let dir = config.network_dir();
     tracing::info!("bitdexter {} on {}, in {}", env!("CARGO_PKG_VERSION"), config.network, dir.display());
@@ -103,6 +107,10 @@ async fn main() -> Result<()> {
     let node = Node::new(node_config, &dir, writer, status.clone(), mempool.clone(), mempool_tx.clone(), relay_rx)?;
 
     let (shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
+    let prices = bitdexter::prices::Shared::default();
+    if config.prices {
+        tokio::spawn(bitdexter::prices::poll(prices.clone(), shutdown.clone()));
+    }
     tokio::spawn(async move {
         let _ = tokio::signal::ctrl_c().await;
         tracing::info!("shutting down");
@@ -110,7 +118,7 @@ async fn main() -> Result<()> {
     });
     let api = tokio::spawn(bitdexter::api::serve(
         config.http,
-        bitdexter::api::AppState { store, status, mempool, mempool_tx },
+        bitdexter::api::AppState { store, status, mempool, mempool_tx, prices: prices.clone() },
         bitdexter::api::Extras { blockbook: config.blockbook, blindbit: config.blindbit },
         shutdown.clone(),
     ));

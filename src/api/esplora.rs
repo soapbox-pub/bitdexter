@@ -66,6 +66,7 @@ pub fn router() -> Router<AppState> {
         .route("/mempool/recent", get(mempool_recent))
         .route("/fee-estimates", get(fee_estimates))
         .route("/v1/fees/recommended", get(fees_recommended))
+        .route("/v1/prices", get(prices))
 }
 
 /// The confirmation targets `/fee-estimates` gives rates for, as Esplora's.
@@ -945,6 +946,20 @@ async fn fee_estimates(State(state): State<AppState>) -> Json<Value> {
     let map: serde_json::Map<String, Value> =
         estimates.into_iter().map(|(target, rate)| (target.to_string(), json!(rate))).collect();
     Json(Value::Object(map))
+}
+
+/// mempool.space's `/v1/prices`: the price of a bitcoin in whole units of
+/// each currency, if prices are being fetched.
+async fn prices(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let prices = crate::prices::current(&state.prices).ok_or_else(|| ApiError::not_found("Prices aren't available"))?;
+    let mut body = serde_json::Map::new();
+    body.insert("time".into(), json!(prices.time));
+    for currency in crate::prices::CURRENCIES {
+        if let Some(rate) = prices.rates.get(currency) {
+            body.insert(currency.into(), json!(rate.round() as u64));
+        }
+    }
+    Ok(Json(Value::Object(body)))
 }
 
 /// mempool.space's recommended fees, in whole sat/vB.

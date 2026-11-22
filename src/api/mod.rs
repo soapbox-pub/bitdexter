@@ -23,6 +23,7 @@ pub struct AppState {
     pub mempool: crate::mempool::Shared,
     /// Where transactions sent to the API go to be checked.
     pub mempool_tx: std::sync::mpsc::Sender<(Vec<u8>, crate::mempool::Source)>,
+    pub prices: crate::prices::Shared,
 }
 
 /// An error to answer with: a status and plain text, as Esplora does.

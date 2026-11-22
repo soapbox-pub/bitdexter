@@ -18,6 +18,7 @@ pub mod mempool;
 pub mod network;
 pub mod node;
 pub mod p2p;
+pub mod prices;
 pub mod script;
 pub mod silent;
 pub mod store;

@@ -706,9 +706,21 @@ async fn handle(state: &AppState, method: &str, params: Value) -> Result<Value, 
             let hex_tx = params["hex"].as_str().unwrap_or_default();
             Ok(json!({ "result": send_tx(state, hex_tx).await? }))
         }
-        "getCurrentFiatRates" | "getFiatRatesForTimestamps" | "getFiatRatesTickersList" => {
-            Err("Fiat rates aren't available".into())
+        "getCurrentFiatRates" => {
+            let prices = crate::prices::current(&state.prices).ok_or("Fiat rates aren't available")?;
+            let wanted: Vec<String> = params["currencies"]
+                .as_array()
+                .map(|c| c.iter().filter_map(|c| c.as_str()).map(str::to_lowercase).collect())
+                .unwrap_or_default();
+            let rates: serde_json::Map<String, Value> = prices
+                .rates
+                .iter()
+                .map(|(currency, rate)| (currency.to_lowercase(), json!(rate)))
+                .filter(|(currency, _)| wanted.is_empty() || wanted.contains(currency))
+                .collect();
+            Ok(json!({ "ts": prices.time, "rates": rates }))
         }
+        "getFiatRatesForTimestamps" | "getFiatRatesTickersList" => Err("Historical fiat rates aren't available".into()),
         _ => Err(format!("Unknown method {method}")),
     }
 }
