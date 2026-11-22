@@ -485,25 +485,27 @@ impl Mempool {
     }
 
     /// How many virtual bytes of transactions pay each range of fee rates,
-    /// highest first, as Electrum's `mempool.get_fee_histogram`: each entry
-    /// is a rate in sat/vB and the vsize of those paying more than it but
-    /// less than the entry before.
+    /// highest first, as electrs makes Electrum's `mempool.get_fee_histogram`
+    /// and Esplora's `fee_histogram`: each entry is the lowest rate in its
+    /// bin, in sat/vB, and the vsize of the bin, about 50,000 vbytes.
     pub fn fee_histogram(&self) -> Vec<(f64, u64)> {
-        let mut by_rate: Vec<(u64, u64)> = self.txs.values().map(|e| (e.feerate(), e.vsize)).collect();
-        by_rate.sort_unstable_by_key(|r| std::cmp::Reverse(r.0));
+        const BIN: u64 = 50_000;
+        let mut by_rate: Vec<(f64, u64)> =
+            self.txs.values().map(|e| (e.fee as f64 / e.vsize.max(1) as f64, e.vsize)).collect();
+        by_rate.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
         let mut histogram = Vec::new();
         let mut bin = 0u64;
-        let mut bin_size = 100_000u64;
+        let mut last_rate = 0.0;
         for (rate, vsize) in by_rate {
-            bin += vsize;
-            if bin > bin_size {
-                histogram.push((rate as f64 / 1000.0, bin));
+            if bin > BIN && last_rate != rate {
+                histogram.push((last_rate, bin));
                 bin = 0;
-                bin_size = bin_size * 11 / 10;
             }
+            last_rate = rate;
+            bin += vsize;
         }
         if bin > 0 {
-            histogram.push((0.0, bin));
+            histogram.push((last_rate, bin));
         }
         histogram
     }
