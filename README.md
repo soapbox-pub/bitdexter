@@ -174,6 +174,14 @@ and wrote 29 GB to disk. Merging 38 million transactions and 99 million
 outputs at the end took 11 seconds. (Indexing in place throughout, as the
 first version did, took 157% of the raw size and wrote 128 GB.)
 
+Synced from testnet4's peers to its tip, 162,719 blocks and 15 million
+transactions, in 13 minutes, merging the bulk index in 5 seconds, then
+following it in place, reorgs too. Blocks, transactions, outspends, merkle
+proofs, addresses and unconfirmed transactions compared with mempool.space's
+testnet4 API all match, but for the order of UTXOs (which Esplora leaves
+open), and one address so busy mempool.space gives a different set of its
+UTXOs each time it's asked, some spent in its own chain.
+
 ## Validation
 
 As Bitcoin Core validates, with Core's own script interpreter,
