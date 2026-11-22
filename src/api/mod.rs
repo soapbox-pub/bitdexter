@@ -89,7 +89,11 @@ async fn cors(request: axum::extract::Request, next: axum::middleware::Next) -> 
     response
 }
 
-pub async fn serve(addr: SocketAddr, state: AppState, mut shutdown: tokio::sync::watch::Receiver<bool>) -> anyhow::Result<()> {
+pub async fn serve(
+    addr: SocketAddr,
+    state: AppState,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("serving the API on http://{addr}");
     axum::serve(listener, router(state))

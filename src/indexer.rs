@@ -15,17 +15,32 @@ use crate::store::{ConnectError, Writer};
 use crate::validate::check_block;
 
 pub enum Command {
-    Connect { height: u32, hash: BlockHash, bytes: Vec<u8> },
+    Connect {
+        height: u32,
+        hash: BlockHash,
+        bytes: Vec<u8>,
+    },
     /// Disconnect blocks until `height` is the tip.
-    Rewind { height: u32 },
+    Rewind {
+        height: u32,
+    },
 }
 
 pub enum Event {
-    Connected { height: u32 },
+    Connected {
+        height: u32,
+    },
     /// The block isn't valid. If `mutated`, it's the copy that isn't, not
     /// the block its header names: another may be.
-    Rejected { height: u32, hash: BlockHash, reason: String, mutated: bool },
-    Rewound { height: u32 },
+    Rejected {
+        height: u32,
+        hash: BlockHash,
+        reason: String,
+        mutated: bool,
+    },
+    Rewound {
+        height: u32,
+    },
     Failed(String),
 }
 
@@ -34,7 +49,11 @@ pub enum Event {
 fn is_mutation(reason: &str) -> bool {
     matches!(
         reason,
-        "bad-txnmrklroot" | "bad-txns-duplicate" | "bad-witness-merkle-match" | "bad-witness-nonce-size" | "unexpected-witness"
+        "bad-txnmrklroot"
+            | "bad-txns-duplicate"
+            | "bad-witness-merkle-match"
+            | "bad-witness-nonce-size"
+            | "unexpected-witness"
     )
 }
 

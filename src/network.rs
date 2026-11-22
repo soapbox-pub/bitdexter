@@ -1,8 +1,8 @@
 //! What differs between the networks bitdexter can follow.
 
+use bitcoin::Network;
 use bitcoin::consensus::Params;
 use bitcoin::p2p::Magic;
-use bitcoin::Network;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "lowercase")]

@@ -35,12 +35,7 @@ pub struct P2p {
 
 impl Default for Config {
     fn default() -> Config {
-        Config {
-            network: Chain::Mainnet,
-            data_dir: None,
-            http: ([127, 0, 0, 1], 3000).into(),
-            p2p: P2p::default(),
-        }
+        Config { network: Chain::Mainnet, data_dir: None, http: ([127, 0, 0, 1], 3000).into(), p2p: P2p::default() }
     }
 }
 

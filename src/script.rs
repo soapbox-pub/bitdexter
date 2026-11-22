@@ -28,15 +28,17 @@ pub fn script_type(bytes: &[u8]) -> &'static str {
         "anchor"
     } else if script.is_multisig() {
         "multisig"
-    } else if {
-        // As Esplora decides it, with rust-bitcoin's method.
-        #[allow(deprecated)]
-        script.is_provably_unspendable()
-    } {
+    } else if provably_unspendable(script) {
         "provably_unspendable"
     } else {
         "unknown"
     }
+}
+
+/// As Esplora decides it, with rust-bitcoin's method.
+#[allow(deprecated)]
+fn provably_unspendable(script: &Script) -> bool {
+    script.is_provably_unspendable()
 }
 
 pub fn address(bytes: &[u8], network: Network) -> Option<String> {

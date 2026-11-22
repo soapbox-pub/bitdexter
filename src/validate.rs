@@ -7,7 +7,7 @@
 use std::collections::HashSet;
 
 use crate::block::Block;
-use crate::hash::{merkle_root, sha256d_parts, Hash};
+use crate::hash::{Hash, merkle_root, sha256d_parts};
 use crate::network::Chain;
 
 pub const MAX_MONEY: u64 = 21_000_000 * 100_000_000;

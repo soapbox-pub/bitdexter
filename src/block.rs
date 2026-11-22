@@ -1,7 +1,7 @@
 //! Blocks and transactions parsed in place, as slices of the bytes they came
 //! in, with their hashes computed once.
 
-use crate::hash::{sha256d, sha256d_parts, Hash};
+use crate::hash::{Hash, sha256d, sha256d_parts};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseError(pub &'static str);

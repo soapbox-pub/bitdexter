@@ -40,7 +40,7 @@ pub fn merkle_root(mut leaves: Vec<Hash>) -> (Hash, bool) {
     }
     let mut mutated = false;
     while leaves.len() > 1 {
-        for pair in leaves.chunks_exact(2) {
+        for pair in leaves.as_chunks::<2>().0 {
             if pair[0] == pair[1] {
                 mutated = true;
             }
@@ -48,10 +48,7 @@ pub fn merkle_root(mut leaves: Vec<Hash>) -> (Hash, bool) {
         if leaves.len() % 2 == 1 {
             leaves.push(*leaves.last().unwrap());
         }
-        let next: Vec<Hash> = leaves
-            .chunks_exact(2)
-            .map(|pair| merkle_parent(&pair[0], &pair[1]))
-            .collect();
+        let next: Vec<Hash> = leaves.chunks_exact(2).map(|pair| merkle_parent(&pair[0], &pair[1])).collect();
         leaves = next;
     }
     (leaves[0], mutated)
@@ -66,10 +63,7 @@ pub fn merkle_branch(mut leaves: Vec<Hash>, mut index: usize) -> Vec<Hash> {
         }
         branch.push(leaves[index ^ 1]);
         index /= 2;
-        leaves = leaves
-            .chunks_exact(2)
-            .map(|pair| merkle_parent(&pair[0], &pair[1]))
-            .collect();
+        leaves = leaves.chunks_exact(2).map(|pair| merkle_parent(&pair[0], &pair[1])).collect();
     }
     branch
 }

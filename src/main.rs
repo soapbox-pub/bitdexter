@@ -83,11 +83,8 @@ async fn main() -> Result<()> {
         tracing::info!("shutting down");
         let _ = shutdown_tx.send(true);
     });
-    let api = tokio::spawn(bitdexter::api::serve(
-        config.http,
-        bitdexter::api::AppState { store, status },
-        shutdown.clone(),
-    ));
+    let api =
+        tokio::spawn(bitdexter::api::serve(config.http, bitdexter::api::AppState { store, status }, shutdown.clone()));
     node.run(shutdown).await?;
     api.abort();
     Ok(())

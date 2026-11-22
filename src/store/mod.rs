@@ -42,11 +42,11 @@ use anyhow::{Context, Result};
 
 use crate::block::{Block, Tx};
 use crate::compact::{self, CompactTx};
-use crate::hash::{sha256, sha256d, Hash};
+use crate::hash::{Hash, sha256, sha256d};
 use crate::network::Chain;
-use crate::validate::{Invalid, COINBASE_MATURITY, MAX_MONEY};
+use crate::validate::{COINBASE_MATURITY, Invalid, MAX_MONEY};
 use column::{Column, ColumnWriter};
-use txid_table::{key_of, TxidTable};
+use txid_table::{TxidTable, key_of};
 
 pub const BLOCK_WIDTH: usize = 112;
 pub const TXIDX_WIDTH: usize = 11;
@@ -634,22 +634,13 @@ impl Writer {
 
     /// The number of the output an input spends, checking that it exists
     /// and, if a coinbase's, is mature.
-    fn spend(
-        &self,
-        txid: Hash,
-        vout: u32,
-        height: u32,
-        block_first_tx: u64,
-    ) -> std::result::Result<u64, ConnectError> {
+    fn spend(&self, txid: Hash, vout: u32, height: u32, block_first_tx: u64) -> std::result::Result<u64, ConnectError> {
         let Some(prev) = self.txnum_of(&txid) else {
             return reject("bad-txns-inputs-missingorspent");
         };
         let (_, first_out) = decode_txidx(self.txidx.get(prev));
-        let next_out = if prev + 1 < self.txidx.len() {
-            decode_txidx(self.txidx.get(prev + 1)).1
-        } else {
-            self.outs.len()
-        };
+        let next_out =
+            if prev + 1 < self.txidx.len() { decode_txidx(self.txidx.get(prev + 1)).1 } else { self.outs.len() };
         if vout as u64 >= next_out - first_out {
             return reject("bad-txns-inputs-missingorspent");
         }
@@ -660,11 +651,8 @@ impl Writer {
         // A coinbase is the first transaction of its block.
         let first_txs = self.store.first_txs.read().unwrap();
         let prev_height = first_txs.partition_point(|&first| first <= prev);
-        let is_coinbase = if prev >= block_first_tx {
-            prev == block_first_tx
-        } else {
-            first_txs[prev_height - 1] == prev
-        };
+        let is_coinbase =
+            if prev >= block_first_tx { prev == block_first_tx } else { first_txs[prev_height - 1] == prev };
         if is_coinbase {
             let prev_height = if prev >= block_first_tx { height } else { prev_height as u32 - 1 };
             if height - prev_height < COINBASE_MATURITY {
@@ -762,8 +750,7 @@ impl Writer {
 
     /// Whether enough has been indexed since the last commit to make one.
     pub fn should_commit(&self) -> bool {
-        self.uncommitted > 0
-            && (self.last_commit.elapsed().as_secs() >= 10 || self.history.len() >= 20_000_000)
+        self.uncommitted > 0 && (self.last_commit.elapsed().as_secs() >= 10 || self.history.len() >= 20_000_000)
     }
 
     pub fn has_uncommitted(&self) -> bool {
@@ -830,7 +817,8 @@ impl Writer {
             let txid: Hash = self.txids.get(txnum).try_into().unwrap();
             table.remove(&txid, txnum, |num| key_of(self.txids.get(num).try_into().unwrap()));
         }
-        let data_start = if record.first_tx < counts.txs { decode_txidx(self.txidx.get(record.first_tx)).0 } else { counts.data };
+        let data_start =
+            if record.first_tx < counts.txs { decode_txidx(self.txidx.get(record.first_tx)).0 } else { counts.data };
         self.blocks.truncate(height as u64);
         self.txids.truncate(record.first_tx);
         self.txidx.truncate(record.first_tx);

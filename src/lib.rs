@@ -2,6 +2,10 @@
 //! peer-to-peer network, keeps it in a compact format of its own, and
 //! serves an Esplora-compatible API.
 
+// Fixed-size chunks read as plainly with `chunks_exact`, and lengths are
+// counts here, not containers that can be empty.
+#![allow(clippy::chunks_exact_to_as_chunks, clippy::len_without_is_empty)]
+
 pub mod api;
 pub mod block;
 pub mod chain;

@@ -87,12 +87,16 @@ impl HeaderChain {
     /// accepted from now on there.
     pub fn open(chain: Chain, path: &Path) -> Result<HeaderChain> {
         let mut headers = HeaderChain::new(chain);
-        let mut file = OpenOptions::new().read(true).append(true).create(true).open(path)
+        let mut file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create(true)
+            .open(path)
             .with_context(|| format!("opening {}", path.display()))?;
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes)?;
         let mut good = 0;
-        for raw in bytes.chunks_exact(80) {
+        for raw in bytes.as_chunks::<80>().0 {
             let header: Header = deserialize(raw)?;
             match headers.accept_one(header, false) {
                 Ok(_) => good += 80,
@@ -111,6 +115,10 @@ impl HeaderChain {
 
     pub fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        false
     }
 
     pub fn tip_height(&self) -> u32 {
@@ -185,7 +193,7 @@ impl HeaderChain {
         let interval = (params.pow_target_timespan / params.pow_target_spacing) as u32;
         let height = parent.height + 1;
         let pow_limit = params.max_attainable_target.to_compact_lossy();
-        if height % interval != 0 {
+        if !height.is_multiple_of(interval) {
             if params.allow_min_difficulty_blocks {
                 // A block more than twice the spacing after the last may be
                 // at the lowest difficulty; others have that of the last block
@@ -196,7 +204,7 @@ impl HeaderChain {
                 let mut id = parent_id;
                 loop {
                     let entry = &self.entries[id as usize];
-                    if entry.parent == NONE || entry.height % interval == 0 || entry.header.bits != pow_limit {
+                    if entry.parent == NONE || entry.height.is_multiple_of(interval) || entry.header.bits != pow_limit {
                         return entry.header.bits;
                     }
                     id = entry.parent;
@@ -235,7 +243,7 @@ impl HeaderChain {
         }
         let interval = (params.pow_target_timespan / params.pow_target_spacing) as u32;
         if self.chain.enforces_bip94()
-            && height % interval == 0
+            && height.is_multiple_of(interval)
             && header.time < parent.header.time.saturating_sub(MAX_TIMEWARP)
         {
             return Err(HeaderError::Invalid("time-timewarp-attack"));
@@ -257,7 +265,11 @@ impl HeaderChain {
     fn accept_one(&mut self, header: Header, check_clock: bool) -> Result<bool, HeaderError> {
         let hash = header.block_hash();
         if let Some(&id) = self.by_hash.get(&hash) {
-            return if self.entries[id as usize].invalid { Err(HeaderError::Invalid("duplicate-invalid")) } else { Ok(false) };
+            return if self.entries[id as usize].invalid {
+                Err(HeaderError::Invalid("duplicate-invalid"))
+            } else {
+                Ok(false)
+            };
         }
         let &parent_id = self.by_hash.get(&header.prev_blockhash).ok_or(HeaderError::Orphan)?;
         self.check(&header, parent_id, check_clock)?;

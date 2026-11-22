@@ -94,7 +94,7 @@ pub fn compress_amount(mut n: u64) -> u64 {
         return 0;
     }
     let mut e = 0;
-    while n % 10 == 0 && e < 9 {
+    while n.is_multiple_of(10) && e < 9 {
         n /= 10;
         e += 1;
     }
