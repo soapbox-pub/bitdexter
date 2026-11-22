@@ -280,6 +280,16 @@ pub fn encode(tx: &Tx<'_>, first_out: u64, spent: &[u64], out: &mut Vec<u8>) {
     }
 }
 
+/// The items of a witness as serialized, its item count first.
+pub fn witness_items(witness: &[u8]) -> Vec<&[u8]> {
+    if witness.is_empty() {
+        return Vec::new();
+    }
+    let mut r = RawReader::new(witness);
+    let n = r.length().unwrap_or(0);
+    (0..n).map_while(|_| r.var_bytes().ok()).collect()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompactInput<'a> {
     /// The number of the output it spends, or `None` for a coinbase's input.
@@ -294,12 +304,7 @@ pub struct CompactInput<'a> {
 impl CompactInput<'_> {
     /// The witness's items.
     pub fn witness_items(&self) -> Vec<&[u8]> {
-        if self.witness.is_empty() {
-            return Vec::new();
-        }
-        let mut r = RawReader::new(self.witness);
-        let n = r.length().unwrap_or(0);
-        (0..n).map_while(|_| r.var_bytes().ok()).collect()
+        witness_items(self.witness)
     }
 }
 
@@ -453,7 +458,7 @@ mod tests {
 
     #[test]
     fn tx_round_trips() {
-        let hex = "01000000000102fff7f7881a8099afa6940d42d1e7f6362bec38171ea3edf433541db4e4ad969f00000000494830450221008b9d1dc26ba6a9cb62127b02742fa9d754cd3bebf337f7a55d114c8e5cdd30be022040529b194ba3f9281a99f2b1c0a19c0489bc22ede944ccf4ecbab4cc618ef3ed01eeffffffef51e1b804cc89d182d279655c3aa89e815b1b309fe287d9b2b55d57b90ec68a0100000000ffffffff02202cb206000000001976a9148280b37df378db99f66f85c95a783a76ac7a6d5988ac9093510d000000001976a9143bde42dbee7e4dbe6a21b2d50ce2f0167faa815988ac000247304402203609e17b84f6a7d30c80bfa610b5b4542f32a8a0d5447a12fb1366d7f01cc44a0220573a954c4518331561406f90300e8f3358f51928d43c212a8caed02de67eebee0121025476c2e83188368da1ff3e292e7acafcdb3566bb0ad253f62fc70f07aeeb635711000000";
+        let hex = "01000000000102fff7f7881a8099afa6940d42d1e7f6362bec38171ea3edf433541db4e4ad969f00000000494830450221008b9d1dc26ba6a9cb62127b02742fa9d754cd3bebf337f7a55d114c8e5cdd30be022040529b194ba3f9281a99f2b1c0a19c0489bc22ede944ccf4ecbab4cc618ef3ed01eeffffffef51e1b804cc89d182d279655c3aa89e815b1b309fe287d9b2b55d57b90ec68a0100000000ffffffff02202cb206000000001976a9148280b37df378db99f66f85c95a783a76ac7a6d5988ac9093510d000000001976a9143bde42dbee7e4dbe6a21b2d50ce2f0167faa815988ac000247304402203609e17b84f6a7d30c80bfa610b5b4542f32a8a0d5447a12fb1366d7f01cc44a0220573a954c4518331561406f90300e8f3358f51928d43c212a8caed02de67eebee0121025476c2e83188368da1ff3e292e7acafcdb3566bb0ad253f62fc70f07aeee635711000000";
         let raw = hex::decode(hex).unwrap();
         let tx = parse_tx(&raw).unwrap();
         let first_out = 1_000_000;

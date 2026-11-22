@@ -21,7 +21,15 @@ const CAUGHT_UP: u32 = 6;
 
 pub enum Command {
     /// Index a block. `target` is the height the node's syncing to.
-    Connect { height: u32, hash: BlockHash, bytes: Vec<u8>, target: u32 },
+    Connect {
+        height: u32,
+        hash: BlockHash,
+        bytes: Vec<u8>,
+        target: u32,
+        /// Whether to verify its scripts: not at or below the assumevalid
+        /// block.
+        verify: bool,
+    },
     /// Disconnect blocks until `height` is the tip.
     Rewind { height: u32 },
 }
@@ -99,7 +107,7 @@ pub fn spawn(
                     Err(mpsc::error::TryRecvError::Disconnected) => break,
                 };
                 match command {
-                    Command::Connect { height, hash, bytes, target: to } => {
+                    Command::Connect { height, hash, bytes, target: to, verify } => {
                         target = to;
                         if height != writer.next_height() {
                             // Sent before a block it builds on was rejected.
@@ -112,7 +120,7 @@ pub fn spawn(
                             let _ = events.send(Event::Failed(format!("starting bulk indexing: {err:#}")));
                             return;
                         }
-                        match connect(&mut writer, height, hash, &bytes, &mut progress) {
+                        match connect(&mut writer, height, hash, &bytes, verify, &mut progress) {
                             Ok(()) => {
                                 let _ = events.send(Event::Connected { height });
                             }
@@ -161,6 +169,7 @@ fn connect(
     height: u32,
     hash: BlockHash,
     bytes: &[u8],
+    verify: bool,
     progress: &mut Progress,
 ) -> Result<(), ConnectError> {
     let invalid = |reason: String| ConnectError::Invalid(crate::validate::Invalid(reason));
@@ -169,7 +178,7 @@ fn connect(
         return Err(invalid("parse: a different block".into()));
     }
     check_block(&block, height, writer.store.chain).map_err(ConnectError::Invalid)?;
-    writer.connect(&block)?;
+    writer.connect(&block, verify)?;
     progress.blocks += 1;
     progress.txs += block.txs.len() as u64;
     progress.bytes += bytes.len() as u64;

@@ -96,6 +96,44 @@ impl Chain {
         }
     }
 
+    /// The first block in which relative lock times (BIP68, BIP112, BIP113)
+    /// are enforced.
+    pub fn csv_height(self) -> u32 {
+        match self {
+            Chain::Mainnet => 419_328,
+            Chain::Testnet4 | Chain::Signet | Chain::Regtest => 1,
+        }
+    }
+
+    /// The block whose scripts needn't be verified, nor those of the blocks
+    /// before it, if it's in the best chain: as Bitcoin Core's assumevalid,
+    /// a block buried deep enough that it, and the chain to it, are known
+    /// good. Checked against bitdexter's own headers and mempool.space.
+    pub fn assume_valid(self) -> Option<(u32, &'static str)> {
+        match self {
+            Chain::Mainnet => Some((950_000, "000000000000000000010b93c9ea1c29fea277383f0f7d1f26de8b5802e885ff")),
+            Chain::Testnet4 => Some((150_000, "0000000000d9877342754dea8ec1eb24631517d38e3443c370465ee53a8b7434")),
+            Chain::Signet => Some((320_000, "0000000740ae66b284da84387dcfa14d7b1385b0bad482005ba4e770ea6c4b95")),
+            Chain::Regtest => None,
+        }
+    }
+
+    /// The rules block `hash` is held to instead of today's, if it's one of
+    /// the two that broke them (as Bitcoin Core's `script_flag_exceptions`).
+    pub fn script_flag_exception(self, hash: &[u8; 32]) -> Option<crate::consensus::ScriptException> {
+        use crate::consensus::ScriptException;
+        if self != Chain::Mainnet {
+            return None;
+        }
+        match crate::hash::to_hex_rev(hash).as_str() {
+            // BIP16's exception.
+            "00000000000002dc756eebf4f49723ed8d30cc28a5f108eb94b1ba88ac4f9c22" => Some(ScriptException::None),
+            // Taproot's.
+            "0000000000000000000f14c35b2d841e986ab5441de8c585d5ffe55ea1e395ad" => Some(ScriptException::P2shWitness),
+            _ => None,
+        }
+    }
+
     /// Whether difficulty is retargeted from the first block of each period,
     /// rather than the last, and the timewarp attack is ruled out (BIP94).
     pub fn enforces_bip94(self) -> bool {

@@ -39,6 +39,9 @@ struct Args {
     /// Index in bulk when more than this many blocks behind.
     #[arg(long)]
     bulk_threshold: Option<u32>,
+    /// Verify every block's scripts, even below the assumevalid block.
+    #[arg(long)]
+    verify_all: bool,
 }
 
 #[tokio::main]
@@ -68,6 +71,9 @@ async fn main() -> Result<()> {
     if let Some(threshold) = args.bulk_threshold {
         config.bulk_threshold = threshold;
     }
+    if args.verify_all {
+        config.assume_valid = false;
+    }
 
     let dir = config.network_dir();
     tracing::info!("bitdexter {} on {}, in {}", env!("CARGO_PKG_VERSION"), config.network, dir.display());
@@ -81,6 +87,7 @@ async fn main() -> Result<()> {
         max_peers: config.p2p.max_peers,
         stop_height: config.p2p.stop_height,
         bulk_threshold: config.bulk_threshold,
+        assume_valid: config.assume_valid,
     };
     let node = Node::new(node_config, &dir, writer, status.clone())?;
 

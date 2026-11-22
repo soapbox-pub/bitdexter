@@ -34,6 +34,7 @@ use std::time::Instant;
 
 use anyhow::Result;
 
+use super::checks::Checks;
 use super::column::ColumnWriter;
 use super::history::{Builder, StaticHistory};
 use super::sort::{Partitions, read_u40, u40};
@@ -289,11 +290,16 @@ impl Writer {
 
     /// Indexes a block in bulk, returning its fees. If it turns out to be
     /// invalid, what it appended is cut off and the map rebuilt.
-    pub(super) fn connect_bulk(&mut self, block: &Block<'_>, height: u32) -> std::result::Result<u64, ConnectError> {
+    pub(super) fn connect_bulk(
+        &mut self,
+        block: &Block<'_>,
+        height: u32,
+        verify: bool,
+    ) -> std::result::Result<u64, ConnectError> {
         let before = self.counts();
         let bulk = self.bulk.as_ref().unwrap();
         let logged = (bulk.spends.len, bulk.history.len);
-        let result = self.connect_txs_bulk(block, height);
+        let result = self.connect_txs_bulk(block, height, verify);
         if result.is_err() {
             self.truncate_columns(before);
             let bulk = self.bulk.as_mut().unwrap();
@@ -308,8 +314,14 @@ impl Writer {
         result
     }
 
-    fn connect_txs_bulk(&mut self, block: &Block<'_>, height: u32) -> std::result::Result<u64, ConnectError> {
+    fn connect_txs_bulk<'b>(
+        &mut self,
+        block: &Block<'b>,
+        height: u32,
+        verify: bool,
+    ) -> std::result::Result<u64, ConnectError> {
         let block_first_tx = self.txids.len();
+        let mut checks = Checks::new(self, block, height, verify);
         let mut fees = 0u64;
         let mut spent = Vec::new();
         let mut encoded = Vec::with_capacity(512);
@@ -333,6 +345,10 @@ impl Writer {
                         return reject("bad-txns-premature-spend-of-coinbase");
                     }
                     let out = decode_out(self.outs.get(outnum));
+                    let script = checks
+                        .wants_scripts()
+                        .then(|| self.prevout_script(block, block_first_tx, prev, input.prev_vout));
+                    checks.input(self.height_of_tx(prev, height, block_first_tx), out.class, out.value, script);
                     let bulk = self.bulk.as_mut().unwrap();
                     bulk.set_spent(outnum);
                     let left = (value & ((1 << COUNT_BITS) - 1)) - 1;
@@ -355,6 +371,7 @@ impl Writer {
                 }
                 fees += value_in - value_out;
             }
+            checks.tx(self, tx)?;
             let first_out = self.outs.len();
             let left = self.append_tx(tx, &spent, &mut encoded);
             let bulk = self.bulk.as_mut().unwrap();
@@ -377,6 +394,7 @@ impl Writer {
         if block.txs[0].outputs.iter().map(|out| out.value).sum::<u64>() > self.store.chain.subsidy(height) + fees {
             return reject("bad-cb-amount");
         }
+        checks.finish(block)?;
         Ok(fees)
     }
 

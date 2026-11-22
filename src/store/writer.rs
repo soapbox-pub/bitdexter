@@ -11,6 +11,7 @@ use std::time::Instant;
 use anyhow::{Context, Result};
 
 use super::bulk::Bulk;
+use super::checks::Checks;
 use super::column::ColumnWriter;
 use super::history::StaticHistory;
 use super::txid_table::{TxidTable, key_of};
@@ -189,18 +190,52 @@ impl Writer {
         (first, next)
     }
 
+    /// The median time past of block `height`: the median of its time and
+    /// the ten before.
+    pub(super) fn mtp(&self, height: u32) -> u32 {
+        let mut times: Vec<u32> = (height.saturating_sub(10)..=height).map(|h| self.block(h).time()).collect();
+        times.sort_unstable();
+        times[times.len() / 2]
+    }
+
+    /// The height of the block holding transaction `txnum`, which is in the
+    /// block at `height` being connected if it's from `block_first_tx` on.
+    pub(super) fn height_of_tx(&self, txnum: u64, height: u32, block_first_tx: u64) -> u32 {
+        if txnum >= block_first_tx {
+            return height;
+        }
+        let first_txs = self.store.first_txs.read().unwrap();
+        (first_txs.partition_point(|&first| first <= txnum) - 1) as u32
+    }
+
+    /// The script of output `vout` of transaction `txnum`, which is in
+    /// `block` if it's from `block_first_tx` on.
+    pub(super) fn prevout_script(&self, block: &Block<'_>, block_first_tx: u64, txnum: u64, vout: u32) -> Vec<u8> {
+        if txnum >= block_first_tx {
+            return block.txs[(txnum - block_first_tx) as usize].outputs[vout as usize].script.to_vec();
+        }
+        let (start, first_out) = decode_txidx(self.txidx.get(txnum));
+        let end = decode_txidx(self.txidx.get(txnum + 1)).0;
+        let bytes = self.data.range(start, (end - start) as usize);
+        let tx = compact::decode(&bytes, first_out).expect("a stored transaction");
+        tx.outputs.into_iter().nth(vout as usize).expect("an output that exists").script
+    }
+
     /// Indexes `block` as the next, after checking what can be checked only
-    /// with the outputs it spends. The block itself must already have passed
-    /// [`crate::validate::check_block`].
-    pub fn connect(&mut self, block: &Block<'_>) -> std::result::Result<(), ConnectError> {
+    /// with the outputs it spends, scripts too if `verify`. The block itself
+    /// must already have passed [`crate::validate::check_block`].
+    pub fn connect(&mut self, block: &Block<'_>, verify: bool) -> std::result::Result<(), ConnectError> {
         let height = self.next_height();
         let expected_prev = self.tip_hash().unwrap_or([0; 32]);
         if block.prev_hash() != expected_prev {
             return reject("prev-blk-not-tip");
         }
         let before = self.counts();
-        let fees =
-            if self.bulk.is_some() { self.connect_bulk(block, height)? } else { self.connect_in_place(block, height)? };
+        let fees = if self.bulk.is_some() {
+            self.connect_bulk(block, height, verify)?
+        } else {
+            self.connect_in_place(block, height, verify)?
+        };
         let record = BlockRecord {
             header: *block.header,
             first_tx: before.txs,
@@ -249,7 +284,7 @@ impl Writer {
         self.tx_history.clear();
         for (vout, out) in tx.outputs.iter().enumerate() {
             let can = is_spendable(out.script);
-            self.outs.push(&out_record(out.value, can));
+            self.outs.push(&out_record(out.value, out.script));
             if can {
                 spendable += 1;
                 self.tx_history.push((script_key(out.script), first_out + vout as u64));
@@ -263,7 +298,12 @@ impl Writer {
         spendable
     }
 
-    fn connect_in_place(&mut self, block: &Block<'_>, height: u32) -> std::result::Result<u64, ConnectError> {
+    fn connect_in_place(
+        &mut self,
+        block: &Block<'_>,
+        height: u32,
+        verify: bool,
+    ) -> std::result::Result<u64, ConnectError> {
         self.mark_dirty()?;
         let table = self.store.table();
         if table.needs_growing(block.txs.len() as u64) {
@@ -275,7 +315,7 @@ impl Writer {
         let mut spent_now = Vec::new();
         let mut inserted = Vec::new();
         self.rebuilt_in_block = false;
-        let result = self.connect_txs_in_place(block, height, &mut spent_now, &mut inserted);
+        let result = self.connect_txs_in_place(block, height, verify, &mut spent_now, &mut inserted);
         if result.is_err() {
             // Undo what the block changed in place, then forget the rest.
             for &outnum in &spent_now {
@@ -302,14 +342,16 @@ impl Writer {
     }
 
     /// Indexes the block's transactions in place, returning their fees.
-    fn connect_txs_in_place(
+    fn connect_txs_in_place<'b>(
         &mut self,
-        block: &Block<'_>,
+        block: &Block<'b>,
         height: u32,
+        verify: bool,
         spent_now: &mut Vec<u64>,
         inserted: &mut Vec<(Hash, u64, Option<u64>)>,
     ) -> std::result::Result<u64, ConnectError> {
         let block_first_tx = self.txids.len();
+        let mut checks = Checks::new(self, block, height, verify);
         let mut fees = 0u64;
         let mut spent = Vec::new();
         let mut encoded = Vec::with_capacity(512);
@@ -334,6 +376,10 @@ impl Writer {
                     if self.immature_coinbase(prev, height, block_first_tx) {
                         return reject("bad-txns-premature-spend-of-coinbase");
                     }
+                    let script = checks
+                        .wants_scripts()
+                        .then(|| self.prevout_script(block, block_first_tx, prev, input.prev_vout));
+                    checks.input(self.height_of_tx(prev, height, block_first_tx), out.class, out.value, script);
                     self.outs.set(outnum, VALUE_BYTES, &spent_bytes(txnum));
                     spent_now.push(outnum);
                     spent.push(outnum);
@@ -350,6 +396,7 @@ impl Writer {
                 }
                 fees += value_in - value_out;
             }
+            checks.tx(self, tx)?;
             self.append_tx(tx, &spent, &mut encoded);
             for &(key, outnum) in &self.tx_history {
                 self.history.push((key, outnum_value(outnum)));
@@ -359,6 +406,7 @@ impl Writer {
         if block.txs[0].outputs.iter().map(|out| out.value).sum::<u64>() > self.store.chain.subsidy(height) + fees {
             return reject("bad-cb-amount");
         }
+        checks.finish(block)?;
         Ok(fees)
     }
 

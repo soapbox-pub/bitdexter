@@ -8,7 +8,7 @@
 //! | `blocks` | block | header, first tx and output numbers, size, weight, fees (112 B) |
 //! | `txids` | transaction | its txid (32 B) |
 //! | `txidx` | transaction | where its compact form starts in `txdata`, its first output number (11 B) |
-//! | `outs` | output | its value, whether it can be spent, and the number of the transaction that spent it, plus one (12 B) |
+//! | `outs` | output | its value, its script's [`ScriptClass`], whether it can be spent, and the number of the transaction that spent it, plus one (12 B) |
 //! | `txdata` | byte | transactions in [compact form](crate::compact) |
 //! | `txid.table` | — | txid → transaction number ([`TxidTable`]) |
 //! | `history` | — | script → the outputs paying it, up to 100 blocks below the tip ([`StaticHistory`]) |
@@ -45,10 +45,13 @@
 //! transaction past the state's counts and rebuilds the txid table.
 
 pub mod bulk;
+mod checks;
 pub mod column;
 pub mod history;
 pub mod lmdb;
 pub mod sort;
+#[cfg(test)]
+mod tests;
 pub mod txid_table;
 mod writer;
 
@@ -60,6 +63,7 @@ use std::sync::{Arc, RwLock};
 use anyhow::{Context, Result};
 
 use crate::compact::{self, CompactTx};
+use crate::consensus::ScriptClass;
 use crate::hash::{Hash, sha256, sha256d};
 use crate::network::Chain;
 use crate::validate::Invalid;
@@ -72,6 +76,10 @@ pub const BLOCK_WIDTH: usize = 112;
 pub const TXIDX_WIDTH: usize = 11;
 pub const OUT_WIDTH: usize = 12;
 const VALUE_BYTES: usize = 7;
+/// Amounts take 51 bits: 21 million bitcoin is less than 2⁵¹ satoshis.
+const VALUE_MASK: u64 = (1 << 51) - 1;
+/// Where an output's [`ScriptClass`] is kept, beside its value.
+const CLASS_SHIFT: u32 = 51;
 /// Set in an output's value when it can never be spent.
 const UNSPENDABLE: u64 = 1 << 55;
 /// How deep a reorg may go: history this far below the tip may be merged
@@ -79,7 +87,7 @@ const UNSPENDABLE: u64 = 1 << 55;
 pub const REORG_DEPTH: u32 = 100;
 
 /// The format the files are in, bumped when it changes.
-const FORMAT: u32 = 2;
+const FORMAT: u32 = 3;
 
 fn read_le(bytes: &[u8]) -> u64 {
     let mut buf = [0u8; 8];
@@ -144,8 +152,11 @@ fn decode_txidx(bytes: &[u8]) -> (u64, u64) {
     (read_le(&bytes[..6]), read_le(&bytes[6..11]))
 }
 
-fn out_record(value: u64, spendable: bool) -> [u8; OUT_WIDTH] {
-    let value = if spendable { value } else { value | UNSPENDABLE };
+fn out_record(value: u64, script: &[u8]) -> [u8; OUT_WIDTH] {
+    let mut value = value | (ScriptClass::of(script) as u64) << CLASS_SHIFT;
+    if !is_spendable(script) {
+        value |= UNSPENDABLE;
+    }
     let mut out = [0u8; OUT_WIDTH];
     out[..VALUE_BYTES].copy_from_slice(&value.to_le_bytes()[..VALUE_BYTES]);
     out
@@ -156,6 +167,7 @@ fn out_record(value: u64, spendable: bool) -> [u8; OUT_WIDTH] {
 pub struct Out {
     pub value: u64,
     pub spendable: bool,
+    pub class: ScriptClass,
     /// The transaction that spent it.
     pub spent: Option<u64>,
 }
@@ -163,8 +175,9 @@ pub struct Out {
 fn decode_out(bytes: &[u8]) -> Out {
     let value = read_le(&bytes[..VALUE_BYTES]);
     Out {
-        value: value & (UNSPENDABLE - 1),
+        value: value & VALUE_MASK,
         spendable: value & UNSPENDABLE == 0,
+        class: ScriptClass::from_bits(((value >> CLASS_SHIFT) & 7) as u8),
         spent: read_le(&bytes[VALUE_BYTES..]).checked_sub(1),
     }
 }

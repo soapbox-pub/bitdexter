@@ -211,12 +211,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "bitcoinkernel"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "998431c4dbcccf0a6736e7a7729c4bf6ada90ef93bdc41ee46ba7c9e72da7972"
+dependencies = [
+ "libbitcoinkernel-sys",
+]
+
+[[package]]
 name = "bitdexter"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
  "bitcoin",
+ "bitcoinkernel",
  "clap",
  "hex",
  "libc",
@@ -585,6 +595,15 @@ name = "lazy_static"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
+
+[[package]]
+name = "libbitcoinkernel-sys"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "345d18a1ce19a1becfcaaa066e3a60e9c7813ef5c23ea8c20704ca4ba1a46339"
+dependencies = [
+ "cc",
+]
 
 [[package]]
 name = "libc"

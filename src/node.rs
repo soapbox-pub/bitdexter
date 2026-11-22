@@ -65,6 +65,9 @@ pub struct NodeConfig {
     pub stop_height: Option<u32>,
     /// Index in bulk when more than this many blocks behind.
     pub bulk_threshold: u32,
+    /// Skip verifying the scripts of blocks up to the network's assumevalid
+    /// block, if it's in the best chain.
+    pub assume_valid: bool,
 }
 
 /// What the node's doing, for whoever asks.
@@ -624,6 +627,17 @@ impl Node {
         }
     }
 
+    /// Whether the scripts of the block at `height` on the best chain must be
+    /// verified: unless the assumevalid block is on it, at or above it.
+    fn needs_scripts_verified(&self, height: u32) -> bool {
+        if !self.config.assume_valid {
+            return true;
+        }
+        let Some((av_height, av_hash)) = self.config.chain.assume_valid() else { return true };
+        let on_best = self.headers.at(av_height).is_some_and(|entry| entry.hash.to_string() == av_hash);
+        !(on_best && height <= av_height)
+    }
+
     /// Hands blocks to the indexer, in order, as far as they've arrived.
     fn hand_over(&mut self) {
         loop {
@@ -640,7 +654,8 @@ impl Node {
             if let Some(stop) = self.config.stop_height {
                 target = target.min(stop);
             }
-            let _ = self.indexer_tx.send(indexer::Command::Connect { height: next, hash, bytes, target });
+            let verify = self.needs_scripts_verified(next);
+            let _ = self.indexer_tx.send(indexer::Command::Connect { height: next, hash, bytes, target, verify });
         }
     }
 }

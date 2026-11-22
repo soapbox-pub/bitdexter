@@ -20,6 +20,9 @@ pub struct Config {
     /// Index in bulk, merging once caught up, when more than this many
     /// blocks behind.
     pub bulk_threshold: u32,
+    /// Skip verifying scripts up to the network's assumevalid block, as
+    /// Bitcoin Core does; false verifies every block's.
+    pub assume_valid: bool,
     pub p2p: P2p,
 }
 
@@ -43,6 +46,7 @@ impl Default for Config {
             data_dir: None,
             http: ([127, 0, 0, 1], 3000).into(),
             bulk_threshold: 1000,
+            assume_valid: true,
             p2p: P2p::default(),
         }
     }
