@@ -8,13 +8,16 @@ API. No Bitcoin Core node is needed: it's one program and one data directory.
 **Status: early.** It syncs mainnet, testnet4, signet and regtest from peers, follows
 reorgs, survives crashes, and serves Esplora's read API for blocks, transactions
 and addresses, matching Bitcoin Core and mempool.space byte for byte where tested.
-It doesn't verify scripts yet, and has no mempool, so no broadcasting or fee
-estimates: see [Roadmap](#roadmap).
+It has no mempool yet, so no broadcasting or fee estimates: see
+[Roadmap](#roadmap).
 
 ## Running
 
+Building needs Rust, a C and C++ compiler, cmake and boost (for
+libbitcoinkernel); `nix develop` gives them all.
+
 ```sh
-cargo build --release
+nix develop --command cargo build --release
 ./target/release/bitdexter --network signet
 ```
 
@@ -106,25 +109,31 @@ first version did, took 157% of the raw size and wrote 128 GB.)
 
 ## Validation
 
+As Bitcoin Core validates, with Core's own script interpreter,
+[libbitcoinkernel](https://github.com/sedited/rust-bitcoinkernel).
+
 Headers are checked fully: proof of work, difficulty retargeting (with
 testnet's minimum-difficulty rule and testnet4's BIP94), median time past,
 future time, and the versions BIP34, BIP65 and BIP66 require. The chain with
 the most work is followed.
 
-Blocks are checked for everything but scripts: merkle root (and mutation),
-witness commitment, weight, coinbase rules (BIP34 height, amount), that every
-input spends an output that exists and is unspent and, if a coinbase's, mature,
-that no transaction makes coins, duplicate inputs, and BIP30.
+Every block is checked for its merkle root (and mutation), witness
+commitment, weight, coinbase (BIP34 height, amount), that every input spends
+an output that exists and is unspent and, if a coinbase's, mature, that no
+transaction makes coins, duplicate inputs, BIP30, sigop cost (BIP141), lock
+times (BIP113) and relative lock times (BIP68).
 
-Not yet: script verification (planned with libbitcoinkernel, above an
-assumevalid block), sigop limits, BIP68/BIP113 lock times, signet's block
-signatures, and a minimum chain work for header sync.
+Scripts are verified on several threads, with the flags Core applies at each
+height, for every block after the network's assumevalid block, a block a few
+months old that Core's would also skip, checked against bitdexter's own
+headers and mempool.space. `--verify-all` verifies every block's.
+
+Not yet: signet's block signatures, and a minimum chain work for header sync.
 
 ## Roadmap
 
 1. ~~Initial sync in bulk.~~ Done.
-2. **Script verification** with libbitcoinkernel above an assumevalid block,
-   and the remaining consensus checks.
+2. ~~Script verification~~ Done.
 3. **Mempool**: transaction relay, `POST /tx`, `/fee-estimates`, `/mempool*`,
    unconfirmed history and balances.
 4. **Blockbook's API**, optionally: REST and WebSocket, xpub and descriptor
@@ -136,8 +145,9 @@ signatures, and a minimum chain work for header sync.
 ## Testing
 
 ```sh
+nix develop
 cargo test
-nix shell nixpkgs#bitcoind --command tests/regtest.py   # against Bitcoin Core
+tests/regtest.py                                         # against Bitcoin Core
 tests/compare.py http://127.0.0.1:3000 https://mempool.space/api /tx/<txid> …
 ```
 
