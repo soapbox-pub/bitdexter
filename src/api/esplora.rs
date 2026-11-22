@@ -5,16 +5,16 @@
 use std::collections::{HashMap, HashSet};
 
 use axum::extract::{Path, State};
-use axum::http::{header, StatusCode};
+use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use bitcoin::Network;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
-use super::{blocking, ApiError, AppState};
+use super::{ApiError, AppState, blocking};
 use crate::compact::CompactTx;
-use crate::hash::{from_hex_rev, merkle_branch, to_hex_rev, Hash};
+use crate::hash::{Hash, from_hex_rev, merkle_branch, to_hex_rev};
 use crate::script;
 use crate::store::{Snapshot, Store};
 
@@ -145,7 +145,7 @@ impl<'a> Ctx<'a> {
             "difficulty": header.target().difficulty_float(),
         });
         if height == 0 {
-            value.as_object_mut().unwrap().remove("previousblockhash");
+            value["previousblockhash"] = Value::Null;
         }
         value
     }
@@ -350,7 +350,7 @@ fn block_txs_page(state: AppState, hash: String, start: usize) -> Result<Respons
     let ctx = Ctx::new(&state);
     let height = ctx.block_height(&hash)?;
     let txnums = block_txnums(&ctx, height);
-    if start % PAGE != 0 {
+    if !start.is_multiple_of(PAGE) {
         return Err(ApiError::bad_request("start index must be a multiple of 25"));
     }
     if start as u64 >= txnums.end - txnums.start {
@@ -364,12 +364,18 @@ async fn block_txs_first(State(state): State<AppState>, Path(hash): Path<String>
     blocking(move || block_txs_page(state, hash, 0)).await
 }
 
-async fn block_txs(State(state): State<AppState>, Path((hash, start)): Path<(String, String)>) -> Result<Response, ApiError> {
+async fn block_txs(
+    State(state): State<AppState>,
+    Path((hash, start)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
     let start: usize = start.parse().map_err(|_| ApiError::bad_request("Invalid start index"))?;
     blocking(move || block_txs_page(state, hash, start)).await
 }
 
-async fn block_txid(State(state): State<AppState>, Path((hash, index)): Path<(String, String)>) -> Result<Response, ApiError> {
+async fn block_txid(
+    State(state): State<AppState>,
+    Path((hash, index)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
     let index: u64 = index.parse().map_err(|_| ApiError::bad_request("Invalid index"))?;
     blocking(move || {
         let ctx = Ctx::new(&state);
@@ -451,7 +457,10 @@ fn outspend(ctx: &Ctx<'_>, txnum: u64, vout: u32) -> Result<Value, ApiError> {
     }))
 }
 
-async fn tx_outspend(State(state): State<AppState>, Path((txid, vout)): Path<(String, String)>) -> Result<Response, ApiError> {
+async fn tx_outspend(
+    State(state): State<AppState>,
+    Path((txid, vout)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
     let vout: u32 = vout.parse().map_err(|_| ApiError::bad_request("Invalid vout"))?;
     blocking(move || {
         let ctx = Ctx::new(&state);
@@ -586,7 +595,11 @@ fn empty_stats() -> Value {
     json!({ "funded_txo_count": 0, "funded_txo_sum": 0, "spent_txo_count": 0, "spent_txo_sum": 0, "tx_count": 0 })
 }
 
-async fn address_stats(State(state): State<AppState>, uri: axum::http::Uri, Path(param): Path<String>) -> Result<Response, ApiError> {
+async fn address_stats(
+    State(state): State<AppState>,
+    uri: axum::http::Uri,
+    Path(param): Path<String>,
+) -> Result<Response, ApiError> {
     blocking(move || {
         let ctx = Ctx::new(&state);
         let by_hash = is_scripthash(&uri);
@@ -603,7 +616,12 @@ async fn address_stats(State(state): State<AppState>, uri: axum::http::Uri, Path
     .await
 }
 
-fn address_txs_page(state: AppState, uri: axum::http::Uri, param: String, last: Option<String>) -> Result<Response, ApiError> {
+fn address_txs_page(
+    state: AppState,
+    uri: axum::http::Uri,
+    param: String,
+    last: Option<String>,
+) -> Result<Response, ApiError> {
     let ctx = Ctx::new(&state);
     let script = script_of(&ctx, &param, is_scripthash(&uri))?;
     let history = History::load(&ctx, &script)?;
@@ -616,11 +634,19 @@ fn address_txs_page(state: AppState, uri: axum::http::Uri, param: String, last: 
     Ok(Json(txs).into_response())
 }
 
-async fn address_txs(State(state): State<AppState>, uri: axum::http::Uri, Path(param): Path<String>) -> Result<Response, ApiError> {
+async fn address_txs(
+    State(state): State<AppState>,
+    uri: axum::http::Uri,
+    Path(param): Path<String>,
+) -> Result<Response, ApiError> {
     blocking(move || address_txs_page(state, uri, param, None)).await
 }
 
-async fn address_txs_chain_first(State(state): State<AppState>, uri: axum::http::Uri, Path(param): Path<String>) -> Result<Response, ApiError> {
+async fn address_txs_chain_first(
+    State(state): State<AppState>,
+    uri: axum::http::Uri,
+    Path(param): Path<String>,
+) -> Result<Response, ApiError> {
     blocking(move || address_txs_page(state, uri, param, None)).await
 }
 
@@ -632,7 +658,11 @@ async fn address_txs_chain(
     blocking(move || address_txs_page(state, uri, param, Some(last))).await
 }
 
-async fn address_txs_mempool(State(state): State<AppState>, uri: axum::http::Uri, Path(param): Path<String>) -> Result<Response, ApiError> {
+async fn address_txs_mempool(
+    State(state): State<AppState>,
+    uri: axum::http::Uri,
+    Path(param): Path<String>,
+) -> Result<Response, ApiError> {
     blocking(move || {
         let ctx = Ctx::new(&state);
         script_of(&ctx, &param, is_scripthash(&uri))?;
@@ -641,7 +671,11 @@ async fn address_txs_mempool(State(state): State<AppState>, uri: axum::http::Uri
     .await
 }
 
-async fn address_utxo(State(state): State<AppState>, uri: axum::http::Uri, Path(param): Path<String>) -> Result<Response, ApiError> {
+async fn address_utxo(
+    State(state): State<AppState>,
+    uri: axum::http::Uri,
+    Path(param): Path<String>,
+) -> Result<Response, ApiError> {
     blocking(move || {
         let ctx = Ctx::new(&state);
         let script = script_of(&ctx, &param, is_scripthash(&uri))?;
