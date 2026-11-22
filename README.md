@@ -34,6 +34,7 @@ assume_valid = true            # skip scripts up to the assumevalid block
 blockbook = false              # serve Blockbook's API too
 blindbit = false               # serve silent payment tweaks too
 prices = false                 # fetch prices from exchanges for /v1/prices
+# electrum = "127.0.0.1:50001"  # serve the Electrum protocol
 
 [p2p]
 peers = []                     # always kept connected, as host:port
@@ -90,6 +91,16 @@ With `blindbit = true` (or `--blindbit`), it serves BIP352 tweaks as
 whether each is spent). A block's tweaks are computed the first time they're
 asked for, from mainnet's taproot activation on, and kept, by block hash, in
 LMDB. They match BIP352's test vectors.
+
+### Electrum
+
+With `electrum = "127.0.0.1:50001"` (or `--electrum`), it serves the
+[Electrum protocol](https://electrum-protocol.readthedocs.io), version 1.4,
+over plain TCP, for Electrum, Sparrow and other wallets: headers, script
+hashes' balances, histories, unspent outputs and mempool transactions,
+transactions and their merkle proofs, fee estimates and histograms,
+broadcasting, and notifications of new blocks and of scripts' status. Put TLS
+in front of it to reach it from elsewhere.
 
 ## Mempool
 
@@ -195,7 +206,7 @@ Not yet: signet's block signatures, and a minimum chain work for header sync.
 5. ~~Silent payments~~ Done.
 6. ~~Prices~~ Done.
 7. A full mainnet sync measured end to end; faster downloads from peers.
-8. The Electrum protocol, and packages.
+8. ~~The Electrum protocol~~ Done. Packages.
 
 ## Testing
 
