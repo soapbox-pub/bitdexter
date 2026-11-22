@@ -11,12 +11,12 @@ pub mod addrman;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use bitcoin::consensus::{deserialize, serialize};
+use bitcoin::p2p::ServiceFlags;
 use bitcoin::p2p::address::Address;
 use bitcoin::p2p::message::{NetworkMessage, RawNetworkMessage};
 use bitcoin::p2p::message_network::VersionMessage;
-use bitcoin::p2p::ServiceFlags;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -113,13 +113,7 @@ fn version_message(addr: SocketAddr, start_height: i32) -> VersionMessage {
 
 /// Connects to `addr` and runs the connection until it ends, reporting it
 /// to `events`.
-pub async fn run_peer(
-    id: PeerId,
-    addr: SocketAddr,
-    chain: Chain,
-    start_height: i32,
-    events: mpsc::Sender<PeerEvent>,
-) {
+pub async fn run_peer(id: PeerId, addr: SocketAddr, chain: Chain, start_height: i32, events: mpsc::Sender<PeerEvent>) {
     let mut connected = false;
     let reason = match connect(id, addr, chain, start_height, &events, &mut connected).await {
         Ok(()) => "closed".to_string(),
@@ -136,7 +130,8 @@ async fn connect(
     events: &mpsc::Sender<PeerEvent>,
     connected: &mut bool,
 ) -> Result<()> {
-    let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await.context("connect timed out")??;
+    let stream =
+        tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await.context("connect timed out")??;
     stream.set_nodelay(true)?;
     let (read, mut write) = stream.into_split();
     let mut read = BufReader::with_capacity(1 << 20, read);
@@ -182,7 +177,10 @@ async fn connect(
     *connected = true;
 
     // Messages are written by a task of their own, so that a slow reader
-    // on the other end can't stall reading from it.
+    // on the other end can't stall reading from it, and another passes on
+    // the node's commands and pings now and then. Reading is never
+    // interrupted part way through a message, which would lose its place
+    // in the stream, except to end the connection.
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let writer = tokio::spawn(async move {
         while let Some(bytes) = out_rx.recv().await {
@@ -191,38 +189,52 @@ async fn connect(
             }
         }
     });
+    let (closed_tx, mut closed) = tokio::sync::oneshot::channel::<()>();
+    let commander = tokio::spawn({
+        let out_tx = out_tx.clone();
+        async move {
+            let mut ping = tokio::time::interval(PING_INTERVAL);
+            ping.tick().await;
+            loop {
+                let message = tokio::select! {
+                    command = commands.recv() => match command {
+                        Some(message) => message,
+                        None => break,
+                    },
+                    _ = ping.tick() => NetworkMessage::Ping(rand::random()),
+                };
+                if out_tx.send(encode(chain, message)).is_err() {
+                    break;
+                }
+            }
+            let _ = closed_tx.send(());
+        }
+    });
     let result = async {
-        let mut ping = tokio::time::interval(PING_INTERVAL);
-        ping.tick().await;
         loop {
-            tokio::select! {
+            let frame = tokio::select! {
                 frame = tokio::time::timeout(IDLE_TIMEOUT, read_frame(&mut read, chain)) => {
-                    let frame = frame.context("idle too long")??;
-                    if frame.command() == b"block" {
-                        events.send(PeerEvent::Block { id, bytes: frame.payload }).await?;
-                        continue;
-                    }
-                    match frame.decode() {
-                        Ok(NetworkMessage::Ping(nonce)) => {
-                            out_tx.send(encode(chain, NetworkMessage::Pong(nonce)))?;
-                        }
-                        Ok(NetworkMessage::Pong(_)) => {}
-                        Ok(message) => events.send(PeerEvent::Message { id, message }).await?,
-                        // Messages rust-bitcoin can't read are skipped.
-                        Err(err) => tracing::trace!("peer {id}: {err:#}"),
-                    }
+                    frame.context("idle too long")??
                 }
-                command = commands.recv() => {
-                    let Some(message) = command else { return Ok(()) };
-                    out_tx.send(encode(chain, message))?;
+                _ = &mut closed => return Ok(()),
+            };
+            if frame.command() == b"block" {
+                events.send(PeerEvent::Block { id, bytes: frame.payload }).await?;
+                continue;
+            }
+            match frame.decode() {
+                Ok(NetworkMessage::Ping(nonce)) => {
+                    out_tx.send(encode(chain, NetworkMessage::Pong(nonce)))?;
                 }
-                _ = ping.tick() => {
-                    out_tx.send(encode(chain, NetworkMessage::Ping(rand::random())))?;
-                }
+                Ok(NetworkMessage::Pong(_)) => {}
+                Ok(message) => events.send(PeerEvent::Message { id, message }).await?,
+                // Messages rust-bitcoin can't read are skipped.
+                Err(err) => tracing::trace!("peer {id}: {err:#}"),
             }
         }
     }
     .await;
     writer.abort();
+    commander.abort();
     result
 }
