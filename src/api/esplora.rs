@@ -72,26 +72,26 @@ pub fn router() -> Router<AppState> {
 const FEE_TARGETS: [u32; 28] =
     [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 144, 504, 1008];
 /// The lowest rate, in sat/vB, a fee estimate gives.
-const FEE_FLOOR: f64 = 1.0;
+pub(super) const FEE_FLOOR: f64 = 1.0;
 /// Unconfirmed transactions in a page of an address's.
 const MEMPOOL_PAGE: usize = 50;
 
 /// A transaction, confirmed or not.
-enum Found<'m> {
+pub(super) enum Found<'m> {
     Confirmed(u64),
     Unconfirmed(&'m Entry),
 }
 
 /// What a request reads: the store as of one commit.
-struct Ctx<'a> {
-    store: &'a Store,
-    snap: Snapshot,
-    network: Network,
-    mempool: RwLockReadGuard<'a, Mempool>,
+pub(super) struct Ctx<'a> {
+    pub store: &'a Store,
+    pub snap: Snapshot,
+    pub network: Network,
+    pub mempool: RwLockReadGuard<'a, Mempool>,
 }
 
 impl<'a> Ctx<'a> {
-    fn new(state: &'a AppState) -> Ctx<'a> {
+    pub fn new(state: &'a AppState) -> Ctx<'a> {
         Ctx {
             store: &state.store,
             snap: state.store.snapshot(),
@@ -101,7 +101,7 @@ impl<'a> Ctx<'a> {
     }
 
     /// The transaction with `txid`, in a block or the mempool.
-    fn find(&self, txid: &str) -> Result<Found<'_>, ApiError> {
+    pub fn find(&self, txid: &str) -> Result<Found<'_>, ApiError> {
         let hash = from_hex_rev(txid).ok_or_else(|| ApiError::bad_request("Invalid hex string"))?;
         if let Some(txnum) = self.store.txnum(&hash) {
             return Ok(Found::Confirmed(txnum));
@@ -109,11 +109,11 @@ impl<'a> Ctx<'a> {
         self.mempool.get(&hash).map(Found::Unconfirmed).ok_or_else(|| ApiError::not_found("Transaction not found"))
     }
 
-    fn tip(&self) -> Result<u32, ApiError> {
+    pub fn tip(&self) -> Result<u32, ApiError> {
         self.snap.tip_height().ok_or_else(|| ApiError::not_found("No blocks indexed yet"))
     }
 
-    fn block_height(&self, hash: &str) -> Result<u32, ApiError> {
+    pub fn block_height(&self, hash: &str) -> Result<u32, ApiError> {
         let hash = from_hex_rev(hash).ok_or_else(|| ApiError::bad_request("Invalid hex string"))?;
         self.store.height_of(&hash).ok_or_else(|| ApiError::not_found("Block not found"))
     }
@@ -123,12 +123,12 @@ impl<'a> Ctx<'a> {
         self.store.txnum(&txid).ok_or_else(|| ApiError::not_found("Transaction not found"))
     }
 
-    fn tx(&self, txnum: u64) -> Result<CompactTx<'a>, ApiError> {
+    pub fn tx(&self, txnum: u64) -> Result<CompactTx<'a>, ApiError> {
         Ok(self.store.tx(txnum, &self.snap)?)
     }
 
     /// The outpoint each input spends.
-    fn prevouts(&self, tx: &CompactTx<'_>) -> Vec<(Hash, u32)> {
+    pub fn prevouts(&self, tx: &CompactTx<'_>) -> Vec<(Hash, u32)> {
         tx.inputs
             .iter()
             .map(|input| match input.spent {
@@ -141,12 +141,12 @@ impl<'a> Ctx<'a> {
             .collect()
     }
 
-    fn raw_tx(&self, txnum: u64) -> Result<Vec<u8>, ApiError> {
+    pub fn raw_tx(&self, txnum: u64) -> Result<Vec<u8>, ApiError> {
         let tx = self.tx(txnum)?;
         Ok(tx.to_raw(&self.prevouts(&tx)))
     }
 
-    fn mediantime(&self, height: u32) -> u32 {
+    pub fn mediantime(&self, height: u32) -> u32 {
         let mut times: Vec<u32> =
             (height.saturating_sub(10)..=height).filter_map(|h| self.store.block(h)).map(|b| b.time()).collect();
         times.sort_unstable();
@@ -658,13 +658,13 @@ fn script_of(ctx: &Ctx<'_>, param: &str, by_hash: bool) -> Result<ScriptRef, Api
     }
 }
 
-enum ScriptRef {
+pub(super) enum ScriptRef {
     Script(Vec<u8>),
     Hash(Hash),
 }
 
 impl ScriptRef {
-    fn key(&self) -> [u8; 8] {
+    pub fn key(&self) -> [u8; 8] {
         match self {
             ScriptRef::Script(script) => crate::store::script_key(script),
             ScriptRef::Hash(hash) => hash[..8].try_into().unwrap(),
@@ -674,7 +674,7 @@ impl ScriptRef {
 
 /// An address's unconfirmed transactions, newest first, and what they pay
 /// it and spend of it.
-fn mempool_activity<'m>(ctx: &'m Ctx<'_>, key: &[u8; 8]) -> (Vec<&'m Entry>, Value) {
+pub(super) fn mempool_activity<'m>(ctx: &'m Ctx<'_>, key: &[u8; 8]) -> (Vec<&'m Entry>, Value) {
     let entries = ctx.mempool.txs_of_script(key);
     let (mut funded, mut funded_sum, mut spent, mut spent_sum) = (0u64, 0u64, 0u64, 0u64);
     for entry in &entries {
@@ -707,14 +707,14 @@ fn is_scripthash(uri: &axum::http::Uri) -> bool {
 }
 
 /// Everything an address has been paid and has spent.
-struct History {
+pub(super) struct History {
     /// Outputs paying it: number, value, the transaction that made it and
     /// the one that spent it.
-    funded: Vec<(u64, u64, u64, Option<u64>)>,
+    pub funded: Vec<(u64, u64, u64, Option<u64>)>,
 }
 
 impl History {
-    fn load(ctx: &Ctx<'_>, script: &ScriptRef) -> Result<History, ApiError> {
+    pub fn load(ctx: &Ctx<'_>, script: &ScriptRef) -> Result<History, ApiError> {
         let outnums = match script {
             ScriptRef::Script(script) => ctx.store.history(script, &ctx.snap)?,
             ScriptRef::Hash(hash) => ctx.store.history_by_hash(hash, &ctx.snap)?,
@@ -731,7 +731,7 @@ impl History {
     }
 
     /// Every transaction it's in, newest first.
-    fn txnums(&self) -> Vec<u64> {
+    pub fn txnums(&self) -> Vec<u64> {
         let mut all: HashSet<u64> = HashSet::new();
         for &(_, _, txnum, spent) in &self.funded {
             all.insert(txnum);

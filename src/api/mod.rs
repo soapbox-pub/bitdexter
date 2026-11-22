@@ -1,6 +1,7 @@
 //! The HTTP APIs, each served at the root and under `/api`, as Esplora
 //! deployments usually are.
 
+pub mod blockbook;
 pub mod esplora;
 
 use std::net::SocketAddr;
@@ -75,14 +76,15 @@ async fn status(axum::extract::State(state): axum::extract::State<AppState>) -> 
     }))
 }
 
-pub fn router(state: AppState) -> Router {
+/// Esplora's API, at the root and under `/api`, and Blockbook's if
+/// `blockbook`.
+pub fn router(state: AppState, blockbook: bool) -> Router {
     let apis = esplora::router();
-    Router::new()
-        .route("/status", get(status))
-        .merge(apis.clone())
-        .nest("/api", apis)
-        .with_state(state)
-        .layer(axum::middleware::from_fn(cors))
+    let mut router = Router::new().route("/status", get(status)).merge(apis.clone()).nest("/api", apis);
+    if blockbook {
+        router = router.merge(blockbook::router());
+    }
+    router.with_state(state).layer(axum::middleware::from_fn(cors))
 }
 
 /// Lets any page read the API, as public Esplora servers do.
@@ -97,11 +99,12 @@ async fn cors(request: axum::extract::Request, next: axum::middleware::Next) -> 
 pub async fn serve(
     addr: SocketAddr,
     state: AppState,
+    blockbook: bool,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("serving the API on http://{addr}");
-    axum::serve(listener, router(state))
+    axum::serve(listener, router(state, blockbook))
         .with_graceful_shutdown(async move {
             let _ = shutdown.changed().await;
         })

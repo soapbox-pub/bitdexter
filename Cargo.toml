@@ -8,7 +8,7 @@ description = "A Bitcoin indexer that syncs over P2P and serves an Esplora-compa
 [dependencies]
 anyhow = "1.0.104"
 bitcoinkernel = "0.3.2"
-axum = "0.8.9"
+axum = { version = "0.8.9", features = ["ws"] }
 bitcoin = { version = "0.32.102", features = ["serde"] }
 clap = { version = "4.6.7", features = ["derive", "wrap_help"] }
 hex = "0.4.3"

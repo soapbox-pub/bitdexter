@@ -42,6 +42,9 @@ struct Args {
     /// Verify every block's scripts, even below the assumevalid block.
     #[arg(long)]
     verify_all: bool,
+    /// Serve Blockbook's API too.
+    #[arg(long)]
+    blockbook: bool,
 }
 
 #[tokio::main]
@@ -74,6 +77,7 @@ async fn main() -> Result<()> {
     if args.verify_all {
         config.assume_valid = false;
     }
+    config.blockbook |= args.blockbook;
 
     let dir = config.network_dir();
     tracing::info!("bitdexter {} on {}, in {}", env!("CARGO_PKG_VERSION"), config.network, dir.display());
@@ -103,6 +107,7 @@ async fn main() -> Result<()> {
     let api = tokio::spawn(bitdexter::api::serve(
         config.http,
         bitdexter::api::AppState { store, status, mempool, mempool_tx },
+        config.blockbook,
         shutdown.clone(),
     ));
     node.run(shutdown).await?;

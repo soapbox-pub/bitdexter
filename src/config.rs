@@ -23,6 +23,8 @@ pub struct Config {
     /// Skip verifying scripts up to the network's assumevalid block, as
     /// Bitcoin Core does; false verifies every block's.
     pub assume_valid: bool,
+    /// Serve Blockbook's API too, at `/websocket` and under `/api/v2`.
+    pub blockbook: bool,
     pub p2p: P2p,
 }
 
@@ -47,6 +49,7 @@ impl Default for Config {
             http: ([127, 0, 0, 1], 3000).into(),
             bulk_threshold: 1000,
             assume_valid: true,
+            blockbook: false,
             p2p: P2p::default(),
         }
     }

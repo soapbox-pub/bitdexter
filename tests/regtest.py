@@ -13,6 +13,7 @@ enough threshold that both the first sync and a catch-up go in bulk.
 bitcoind and bitcoin-cli must be on PATH.
 """
 
+import base64
 import json
 import os
 import shutil
@@ -23,6 +24,7 @@ import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -87,7 +89,7 @@ class Dexter:
             [
                 BITDEXTER, "--network", "regtest", "--data-dir", self.dir, "--http", f"127.0.0.1:{self.http}",
                 "--peer", f"127.0.0.1:{self.core.p2p}", "--connect-only",
-                "--bulk-threshold", str(self.bulk_threshold),
+                "--bulk-threshold", str(self.bulk_threshold), "--blockbook",
             ],
             stdout=self.log,
             stderr=self.log,
@@ -278,6 +280,81 @@ def check_mempool(core, dexter):
     print(f"  checked the mempool: {len(theirs)} relayed, one broadcast, one replaced")
 
 
+def ws_call(port, method, params):
+    """One request over Blockbook's WebSocket API, with a client just big
+    enough for it."""
+    with socket.create_connection(("127.0.0.1", port), timeout=30) as s:
+        key = base64.b64encode(os.urandom(16)).decode()
+        s.sendall(
+            f"GET /websocket HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n".encode()
+        )
+        reply = b""
+        while b"\r\n\r\n" not in reply:
+            reply += s.recv(4096)
+        assert reply.startswith(b"HTTP/1.1 101"), reply
+        rest = reply.split(b"\r\n\r\n", 1)[1]
+        payload = json.dumps({"id": "7", "method": method, "params": params}).encode()
+        mask = os.urandom(4)
+        header = bytes([0x81])
+        if len(payload) < 126:
+            header += bytes([0x80 | len(payload)])
+        else:
+            header += bytes([0x80 | 126]) + len(payload).to_bytes(2, "big")
+        s.sendall(header + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
+
+        def read(n):
+            nonlocal rest
+            while len(rest) < n:
+                rest += s.recv(65536)
+            data, rest = rest[:n], rest[n:]
+            return data
+
+        first, second = read(2)
+        length = second & 0x7F
+        if length == 126:
+            length = int.from_bytes(read(2), "big")
+        elif length == 127:
+            length = int.from_bytes(read(8), "big")
+        message = json.loads(read(length))
+        assert message["id"] == "7", message
+        return message["data"]
+
+
+def check_blockbook(core, dexter):
+    """Checks Blockbook's account scans against the UTXO set, for each kind
+    of account Core's wallet has."""
+    descriptors = core.cli("listdescriptors", wallet="w")["descriptors"]
+    for prefix in ["pkh(", "sh(wpkh(", "wpkh(", "tr("]:
+        receive = next(d["desc"] for d in descriptors if d["desc"].startswith(prefix) and not d["internal"])
+        change = next(d["desc"] for d in descriptors if d["desc"].startswith(prefix) and d["internal"])
+        account = receive.split("#")[0].replace("/0/*)", "/<0;1>/*)")
+        scan = core.cli("scantxoutset", "start", json.dumps([{"desc": receive, "range": 200}, {"desc": change, "range": 200}]))
+        expected = {(u["txid"], u["vout"], round(u["amount"] * 1e8)) for u in scan["unspents"]}
+        quoted = urllib.parse.quote(account, safe="")
+        info = dexter.get(f"/api/v2/xpub/{quoted}?details=txs&tokens=used")
+        assert int(info["balance"]) == sum(v for _, _, v in expected), (prefix, info["balance"], expected)
+        assert info["unconfirmedBalance"] == "0", info["unconfirmedBalance"]
+        used = {t["name"] for t in info["tokens"]}
+        assert info["txs"] == len(info["transactions"]) or info["txs"] > 1000
+        utxos = dexter.get(f"/api/v2/utxo/{quoted}")
+        assert {(u["txid"], u["vout"], int(u["value"])) for u in utxos} == expected, prefix
+        assert all(u["address"] in used for u in utxos)
+        # The same over the WebSocket API.
+        data = ws_call(dexter.http, "getAccountInfo", {"descriptor": account, "details": "basic"})
+        assert data["balance"] == info["balance"], data
+        print(f"  checked a {prefix.rstrip('(')} account: {len(utxos)} UTXOs, {len(used)} used addresses")
+    tip = core.cli("getblockcount")
+    assert ws_call(dexter.http, "getInfo", {})["bestHeight"] == tip
+    block = ws_call(dexter.http, "getBlock", {"id": str(tip), "page": 1, "pageSize": 1})
+    assert block["hash"] == core.cli("getblockhash", tip) and len(block["txs"]) == 1
+    txid = block["txs"][0]["txid"]
+    tx = ws_call(dexter.http, "getTransaction", {"txid": txid})
+    assert tx["hex"] == core.cli("getrawtransaction", txid)
+    fees = ws_call(dexter.http, "estimateFee", {"blocks": [1, 3, 6, 144]})
+    assert len(fees) == 4 and all(int(f["feePerUnit"]) >= 1000 for f in fees), fees
+
+
 def scenario(bulk_threshold):
     tmp = tempfile.mkdtemp(prefix="bitdexter-regtest-")
     core = Core(tmp)
@@ -292,6 +369,9 @@ def scenario(bulk_threshold):
         print("unconfirmed transactions")
         check_mempool(core, dexter)
         check(core, dexter)
+
+        print("Blockbook's API")
+        check_blockbook(core, dexter)
 
         print("reorganizing")
         tip = core.cli("getblockcount")
