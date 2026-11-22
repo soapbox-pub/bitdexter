@@ -12,6 +12,7 @@ pub mod chain;
 pub mod compact;
 pub mod config;
 pub mod consensus;
+pub mod electrum;
 pub mod hash;
 pub mod indexer;
 pub mod mempool;

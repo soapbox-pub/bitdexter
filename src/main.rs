@@ -51,6 +51,9 @@ struct Args {
     /// Fetch the price of bitcoin from exchanges, for `/v1/prices`.
     #[arg(long)]
     prices: bool,
+    /// Serve the Electrum protocol here, as host:port.
+    #[arg(long)]
+    electrum: Option<std::net::SocketAddr>,
 }
 
 #[tokio::main]
@@ -86,6 +89,9 @@ async fn main() -> Result<()> {
     config.blockbook |= args.blockbook;
     config.blindbit |= args.blindbit;
     config.prices |= args.prices;
+    if args.electrum.is_some() {
+        config.electrum = args.electrum;
+    }
 
     let dir = config.network_dir();
     tracing::info!("bitdexter {} on {}, in {}", env!("CARGO_PKG_VERSION"), config.network, dir.display());
@@ -116,6 +122,19 @@ async fn main() -> Result<()> {
         tracing::info!("shutting down");
         let _ = shutdown_tx.send(true);
     });
+    if let Some(addr) = config.electrum {
+        let server = bitdexter::electrum::Server {
+            store: store.clone(),
+            mempool: mempool.clone(),
+            mempool_tx: mempool_tx.clone(),
+        };
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            if let Err(err) = bitdexter::electrum::serve(addr, server, shutdown).await {
+                tracing::error!("serving the Electrum protocol: {err:#}");
+            }
+        });
+    }
     let api = tokio::spawn(bitdexter::api::serve(
         config.http,
         bitdexter::api::AppState { store, status, mempool, mempool_tx, prices: prices.clone() },

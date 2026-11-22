@@ -81,6 +81,7 @@ class Dexter:
         self.bulk_threshold = bulk_threshold
         self.dir = os.path.join(tmp, "dexter")
         self.http = free_port()
+        self.electrum = free_port()
         self.core = core
         self.log = open(os.path.join(tmp, "dexter.log"), "a")
         self.proc = None
@@ -90,7 +91,7 @@ class Dexter:
             [
                 BITDEXTER, "--network", "regtest", "--data-dir", self.dir, "--http", f"127.0.0.1:{self.http}",
                 "--peer", f"127.0.0.1:{self.core.p2p}", "--connect-only",
-                "--bulk-threshold", str(self.bulk_threshold), "--blockbook", "--blindbit",
+                "--bulk-threshold", str(self.bulk_threshold), "--blockbook", "--blindbit", "--electrum", f"127.0.0.1:{self.electrum}",
             ],
             stdout=self.log,
             stderr=self.log,
@@ -443,6 +444,80 @@ def check_blindbit(core, dexter):
     print(f"  checked {checked} silent payment tweaks")
 
 
+class Electrum:
+    """A connection to bitdexter's Electrum server."""
+
+    def __init__(self, port):
+        self.sock = socket.create_connection(("127.0.0.1", port), timeout=30)
+        self.file = self.sock.makefile("rb")
+        self.next_id = 0
+        self.notes = []
+
+    def call(self, method, *params):
+        self.next_id += 1
+        self.sock.sendall((json.dumps({"jsonrpc": "2.0", "id": self.next_id, "method": method, "params": list(params)}) + "\n").encode())
+        while True:
+            message = json.loads(self.file.readline())
+            if "method" in message:
+                self.notes.append(message)
+                continue
+            assert message["id"] == self.next_id, message
+            if "error" in message:
+                raise RuntimeError(message["error"])
+            return message["result"]
+
+    def wait_note(self, method, timeout=30):
+        self.sock.settimeout(timeout)
+        while not any(n["method"] == method for n in self.notes):
+            self.notes.append(json.loads(self.file.readline()))
+        self.sock.settimeout(30)
+        note = next(n for n in self.notes if n["method"] == method)
+        self.notes.remove(note)
+        return note
+
+
+def scripthash(spk_hex):
+    return hashlib.sha256(bytes.fromhex(spk_hex)).digest()[::-1].hex()
+
+
+def check_electrum(core, dexter):
+    """Checks the Electrum protocol against Core and the Esplora API."""
+    e = Electrum(dexter.electrum)
+    assert e.call("server.version", "test", "1.4")[1] == "1.4"
+    tip = core.cli("getblockcount")
+    assert e.call("blockchain.headers.subscribe") == {"height": tip, "hex": core.cli("getblockheader", core.cli("getblockhash", tip), False)}
+    headers = e.call("blockchain.block.headers", tip - 2, 3)
+    assert headers["count"] == 3 and headers["hex"].endswith(core.cli("getblockheader", core.cli("getblockhash", tip), False))
+    checked = 0
+    for u in core.cli("listunspent", 1, 9999999, wallet="w")[:20]:
+        spk = core.cli("getaddressinfo", u["address"], wallet="w")["scriptPubKey"]
+        sh = scripthash(spk)
+        scan = core.cli("scantxoutset", "start", json.dumps([f"addr({u['address']})"]))
+        balance = e.call("blockchain.scripthash.get_balance", sh)
+        assert balance["confirmed"] == round(scan["total_amount"] * 1e8), (balance, scan["total_amount"])
+        unspent = {(x["tx_hash"], x["tx_pos"], x["value"]) for x in e.call("blockchain.scripthash.listunspent", sh)}
+        assert unspent == {(x["txid"], x["vout"], round(x["amount"] * 1e8)) for x in scan["unspents"]}
+        history = e.call("blockchain.scripthash.get_history", sh)
+        assert len(history) == dexter.get(f"/address/{u['address']}")["chain_stats"]["tx_count"]
+        checked += 1
+    txid = core.cli("getblock", core.cli("getblockhash", tip))["tx"][-1]
+    assert e.call("blockchain.transaction.get", txid) == core.cli("getrawtransaction", txid)
+    proof = e.call("blockchain.transaction.get_merkle", txid, tip)
+    assert proof == dexter.get(f"/tx/{txid}/merkle-proof"), proof
+    assert e.call("blockchain.transaction.id_from_pos", tip, proof["pos"]) == txid
+    # A payment to a subscribed script is notified.
+    to = core.cli("getnewaddress", "", "bech32m", wallet="w")
+    sh = scripthash(core.cli("getaddressinfo", to, wallet="w")["scriptPubKey"])
+    assert e.call("blockchain.scripthash.subscribe", sh) is None
+    paid = core.cli("sendtoaddress", to, "0.1", wallet="w")
+    note = e.wait_note("blockchain.scripthash.subscribe")
+    assert note["params"][0] == sh and note["params"][1] is not None
+    assert e.call("blockchain.scripthash.get_mempool", sh)[0]["tx_hash"] == paid
+    core.cli("generatetoaddress", 1, core.cli("getnewaddress", "", "bech32", wallet="w"))
+    assert e.wait_note("blockchain.headers.subscribe")["params"][0]["height"] == tip + 1
+    print(f"  checked the Electrum protocol, {checked} scripts")
+
+
 def scenario(bulk_threshold):
     tmp = tempfile.mkdtemp(prefix="bitdexter-regtest-")
     core = Core(tmp)
@@ -463,6 +538,10 @@ def scenario(bulk_threshold):
 
         print("silent payments")
         check_blindbit(core, dexter)
+
+        print("Electrum protocol")
+        check_electrum(core, dexter)
+        check(core, dexter)
 
         print("reorganizing")
         tip = core.cli("getblockcount")

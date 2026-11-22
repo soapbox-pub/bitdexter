@@ -31,6 +31,8 @@ pub struct Config {
     /// Fetch the price of bitcoin from exchanges every minute, for
     /// `/v1/prices` and Blockbook's fiat rates.
     pub prices: bool,
+    /// Where to serve the Electrum protocol, if anywhere, as `host:port`.
+    pub electrum: Option<SocketAddr>,
     pub p2p: P2p,
 }
 
@@ -58,6 +60,7 @@ impl Default for Config {
             blockbook: false,
             blindbit: false,
             prices: false,
+            electrum: None,
             p2p: P2p::default(),
         }
     }

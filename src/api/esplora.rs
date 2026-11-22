@@ -73,18 +73,18 @@ pub fn router() -> Router<AppState> {
 const FEE_TARGETS: [u32; 28] =
     [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 144, 504, 1008];
 /// The lowest rate, in sat/vB, a fee estimate gives.
-pub(super) const FEE_FLOOR: f64 = 1.0;
+pub(crate) const FEE_FLOOR: f64 = 1.0;
 /// Unconfirmed transactions in a page of an address's.
 const MEMPOOL_PAGE: usize = 50;
 
 /// A transaction, confirmed or not.
-pub(super) enum Found<'m> {
+pub(crate) enum Found<'m> {
     Confirmed(u64),
     Unconfirmed(&'m Entry),
 }
 
 /// What a request reads: the store as of one commit.
-pub(super) struct Ctx<'a> {
+pub(crate) struct Ctx<'a> {
     pub store: &'a Store,
     pub snap: Snapshot,
     pub network: Network,
@@ -93,12 +93,11 @@ pub(super) struct Ctx<'a> {
 
 impl<'a> Ctx<'a> {
     pub fn new(state: &'a AppState) -> Ctx<'a> {
-        Ctx {
-            store: &state.store,
-            snap: state.store.snapshot(),
-            network: state.store.chain.network(),
-            mempool: state.mempool.read().unwrap(),
-        }
+        Ctx::from_parts(&state.store, &state.mempool)
+    }
+
+    pub fn from_parts(store: &'a Store, mempool: &'a crate::mempool::Shared) -> Ctx<'a> {
+        Ctx { store, snap: store.snapshot(), network: store.chain.network(), mempool: mempool.read().unwrap() }
     }
 
     /// The transaction with `txid`, in a block or the mempool.
@@ -659,7 +658,7 @@ fn script_of(ctx: &Ctx<'_>, param: &str, by_hash: bool) -> Result<ScriptRef, Api
     }
 }
 
-pub(super) enum ScriptRef {
+pub(crate) enum ScriptRef {
     Script(Vec<u8>),
     Hash(Hash),
 }
@@ -675,7 +674,7 @@ impl ScriptRef {
 
 /// An address's unconfirmed transactions, newest first, and what they pay
 /// it and spend of it.
-pub(super) fn mempool_activity<'m>(ctx: &'m Ctx<'_>, key: &[u8; 8]) -> (Vec<&'m Entry>, Value) {
+pub(crate) fn mempool_activity<'m>(ctx: &'m Ctx<'_>, key: &[u8; 8]) -> (Vec<&'m Entry>, Value) {
     let entries = ctx.mempool.txs_of_script(key);
     let (mut funded, mut funded_sum, mut spent, mut spent_sum) = (0u64, 0u64, 0u64, 0u64);
     for entry in &entries {
@@ -708,7 +707,7 @@ fn is_scripthash(uri: &axum::http::Uri) -> bool {
 }
 
 /// Everything an address has been paid and has spent.
-pub(super) struct History {
+pub(crate) struct History {
     /// Outputs paying it: number, value, the transaction that made it and
     /// the one that spent it.
     pub funded: Vec<(u64, u64, u64, Option<u64>)>,
