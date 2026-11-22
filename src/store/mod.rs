@@ -212,6 +212,18 @@ fn outnum_from_value(bytes: &[u8]) -> u64 {
     u64::from_be_bytes(buf)
 }
 
+/// An output, as the mempool needs to know it.
+#[derive(Debug, Clone)]
+pub struct Coin {
+    pub outnum: u64,
+    pub value: u64,
+    pub script: Vec<u8>,
+    pub height: u32,
+    pub coinbase: bool,
+    pub spendable: bool,
+    pub spent: bool,
+}
+
 /// How much of the chain is in each column.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Snapshot {
@@ -499,6 +511,37 @@ impl Store {
         let tx = self.tx(txnum, snapshot)?;
         let out = tx.outputs.into_iter().nth(vout as usize).context("output past its transaction's")?;
         Ok((out.value, out.script))
+    }
+
+    /// Output `vout` of the transaction with `txid`, as of `snapshot`.
+    pub fn coin(&self, txid: &Hash, vout: u32, snapshot: &Snapshot) -> Option<Coin> {
+        let txs = snapshot.txs;
+        let txnum = self.table().find(txid, |num| num < txs && self.txids.record(num) == txid)?;
+        if vout as u64 >= self.output_count(txnum, snapshot) {
+            return None;
+        }
+        let outnum = self.txidx(txnum).1 + vout as u64;
+        let out = decode_out(self.outs.record(outnum));
+        let height = self.tx_height(txnum);
+        let coinbase = self.first_txs.read().unwrap()[height as usize] == txnum;
+        let script = self.tx(txnum, snapshot).ok()?.outputs.into_iter().nth(vout as usize)?.script;
+        Some(Coin {
+            outnum,
+            value: out.value,
+            script,
+            height,
+            coinbase,
+            spendable: out.spendable,
+            spent: out.spent.filter(|&by| by < txs).is_some(),
+        })
+    }
+
+    /// The median time past of block `height`, which must be committed.
+    pub fn mtp(&self, height: u32) -> u32 {
+        let mut times: Vec<u32> =
+            (height.saturating_sub(10)..=height).filter_map(|h| self.block(h)).map(|b| b.time()).collect();
+        times.sort_unstable();
+        times.get(times.len() / 2).copied().unwrap_or(0)
     }
 
     /// The numbers of the outputs paying `script`, in chain order.

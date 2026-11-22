@@ -89,7 +89,10 @@ async fn main() -> Result<()> {
         bulk_threshold: config.bulk_threshold,
         assume_valid: config.assume_valid,
     };
-    let node = Node::new(node_config, &dir, writer, status.clone())?;
+    let mempool = bitdexter::mempool::Shared::default();
+    let (relay_tx, relay_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mempool_tx = bitdexter::mempool::spawn(mempool.clone(), store.clone(), relay_tx);
+    let node = Node::new(node_config, &dir, writer, status.clone(), mempool.clone(), mempool_tx.clone(), relay_rx)?;
 
     let (shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
     tokio::spawn(async move {
@@ -97,8 +100,11 @@ async fn main() -> Result<()> {
         tracing::info!("shutting down");
         let _ = shutdown_tx.send(true);
     });
-    let api =
-        tokio::spawn(bitdexter::api::serve(config.http, bitdexter::api::AppState { store, status }, shutdown.clone()));
+    let api = tokio::spawn(bitdexter::api::serve(
+        config.http,
+        bitdexter::api::AppState { store, status, mempool, mempool_tx },
+        shutdown.clone(),
+    ));
     node.run(shutdown).await?;
     api.abort();
     Ok(())

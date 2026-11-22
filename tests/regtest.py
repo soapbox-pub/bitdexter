@@ -98,6 +98,14 @@ class Dexter:
         self.proc.send_signal(sig)
         self.proc.wait(timeout=60)
 
+    def post(self, path, body):
+        req = urllib.request.Request(f"http://127.0.0.1:{self.http}{path}", data=body.encode(), method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return r.status, r.read().decode()
+        except urllib.error.HTTPError as err:
+            return err.code, err.read().decode()
+
     def get(self, path, raw=False):
         with urllib.request.urlopen(f"http://127.0.0.1:{self.http}{path}", timeout=30) as r:
             body = r.read()
@@ -208,6 +216,68 @@ def check(core, dexter):
     print(f"  checked {tip + 1} blocks, {txs} transactions, {len(by_address)} addresses")
 
 
+def until(what, f, timeout=60):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if f():
+            return
+        time.sleep(0.5)
+    raise RuntimeError(f"timed out waiting for {what}")
+
+
+def check_mempool(core, dexter):
+    """Checks unconfirmed transactions: relayed from Core, broadcast to it,
+    replaced, refused, and confirmed."""
+    w = "w"
+    sent = []
+    for kind in ["bech32", "bech32m", "p2sh-segwit", "legacy"]:
+        to = core.cli("getnewaddress", "", kind, wallet=w)
+        sent.append((core.cli("sendtoaddress", to, "0.5", wallet=w), to))
+    theirs = set(core.cli("getrawmempool"))
+    until("relayed transactions", lambda: theirs <= set(dexter.get("/mempool/txids")))
+    for txid, to in sent:
+        tx = dexter.get(f"/tx/{txid}")
+        assert tx["status"] == {"confirmed": False}, tx["status"]
+        assert tx["fee"] == round(core.cli("getmempoolentry", txid)["fees"]["base"] * 1e8)
+        assert dexter.get(f"/tx/{txid}/hex") == core.cli("getrawtransaction", txid)
+        stats = dexter.get(f"/address/{to}")["mempool_stats"]
+        assert stats["funded_txo_sum"] == 50_000_000 and stats["tx_count"] == 1, stats
+        utxos = dexter.get(f"/address/{to}/utxo")
+        assert {"txid": txid, "vout": utxos[0]["vout"], "status": {"confirmed": False}, "value": 50_000_000} in utxos
+        assert dexter.get(f"/address/{to}/txs/mempool")[0]["txid"] == txid
+    info = dexter.get("/mempool")
+    assert info["count"] == len(theirs), info
+    estimates = dexter.get("/fee-estimates")
+    assert set(estimates) >= {"1", "6", "144", "1008"} and all(v >= 1 for v in estimates.values()), estimates
+
+    # Broadcast through bitdexter: Core gets it.
+    to = core.cli("getnewaddress", "", "bech32", wallet=w)
+    raw = core.cli("createrawtransaction", "[]", json.dumps({to: 0.25}))
+    funded = core.cli("fundrawtransaction", raw, wallet=w)["hex"]
+    signed = core.cli("signrawtransactionwithwallet", funded, wallet=w)["hex"]
+    status, txid = dexter.post("/tx", signed)
+    assert status == 200, (status, txid)
+    until("Core to have the broadcast transaction", lambda: txid in core.cli("getrawmempool"))
+    # Sending it again is refused, as is spending what it spends.
+    status, error = dexter.post("/tx", signed)
+    assert status == 400 and "sendrawtransaction RPC error" in error, (status, error)
+    status, error = dexter.post("/tx", "00")
+    assert status == 400, (status, error)
+
+    # Replaced by a fee bump: the replacement takes its place.
+    old = sent[0][0]
+    new = core.cli("bumpfee", old, wallet=w)["txid"]
+    until("the replacement", lambda: new in dexter.get("/mempool/txids"))
+    assert old not in dexter.get("/mempool/txids")
+
+    # Mined: they leave.
+    miner = core.cli("getnewaddress", "", "bech32", wallet=w)
+    core.cli("generatetoaddress", 1, miner)
+    until("an empty mempool", lambda: dexter.get("/mempool")["count"] == len(core.cli("getrawmempool")))
+    assert dexter.get(f"/tx/{txid}/status")["confirmed"]
+    print(f"  checked the mempool: {len(theirs)} relayed, one broadcast, one replaced")
+
+
 def scenario(bulk_threshold):
     tmp = tempfile.mkdtemp(prefix="bitdexter-regtest-")
     core = Core(tmp)
@@ -217,6 +287,10 @@ def scenario(bulk_threshold):
         make_chain(core, 40)
         dexter.start()
         print("syncing")
+        check(core, dexter)
+
+        print("unconfirmed transactions")
+        check_mempool(core, dexter)
         check(core, dexter)
 
         print("reorganizing")

@@ -27,6 +27,7 @@ use tokio::sync::mpsc;
 
 use crate::chain::{HeaderChain, HeaderError};
 use crate::indexer;
+use crate::mempool::{self, Source};
 use crate::network::Chain;
 use crate::p2p::addrman::AddrMan;
 use crate::p2p::{PeerEvent, PeerId, PeerInfo, run_peer};
@@ -127,11 +128,30 @@ pub struct Node {
     /// A moving average of the size of blocks received.
     avg_block: f64,
     last_upkeep: Instant,
+    mempool: mempool::Shared,
+    /// Where transactions from peers go to be checked.
+    mempool_tx: std::sync::mpsc::Sender<(Vec<u8>, Source)>,
+    /// Transactions sent to the API and accepted, to send to peers.
+    relay: mpsc::UnboundedReceiver<Vec<u8>>,
+    /// Those, until they're confirmed, to send again now and then.
+    ours: HashMap<crate::hash::Hash, (Vec<u8>, Instant)>,
+    /// Transactions asked of peers, and when.
+    tx_requests: HashMap<crate::hash::Hash, Instant>,
+    store: std::sync::Arc<crate::store::Store>,
     indexer_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Node {
-    pub fn new(config: NodeConfig, data_dir: &Path, writer: Writer, status: Arc<Mutex<Status>>) -> Result<Node> {
+    pub fn new(
+        config: NodeConfig,
+        data_dir: &Path,
+        writer: Writer,
+        status: Arc<Mutex<Status>>,
+        mempool: mempool::Shared,
+        mempool_tx: std::sync::mpsc::Sender<(Vec<u8>, Source)>,
+        relay: mpsc::UnboundedReceiver<Vec<u8>>,
+    ) -> Result<Node> {
+        let store = writer.store.clone();
         let mut headers = HeaderChain::open(config.chain, &data_dir.join("headers"))?;
         // What's indexed is in the header chain, even if the file lost it.
         let mut sent = Vec::with_capacity(writer.next_height() as usize);
@@ -192,6 +212,12 @@ impl Node {
             request_from: 0,
             avg_block: 1000.0,
             last_upkeep: Instant::now() - Duration::from_secs(1),
+            mempool,
+            mempool_tx,
+            relay,
+            ours: HashMap::new(),
+            tx_requests: HashMap::new(),
+            store,
             indexer_thread: Some(indexer_thread),
         })
     }
@@ -202,6 +228,7 @@ impl Node {
             tokio::select! {
                 Some(event) = self.events.recv() => self.on_peer_event(event),
                 Some(event) = self.indexer.recv() => self.on_indexer_event(event)?,
+                Some(raw) = self.relay.recv() => self.broadcast(raw),
                 Some(addrs) = self.addrs.recv() => {
                     self.seeding = false;
                     for addr in addrs {
@@ -313,6 +340,23 @@ impl Node {
                 });
                 if unknown {
                     self.ask_headers(id);
+                }
+                self.ask_txs(id, &inventory);
+            }
+            NetworkMessage::Tx(tx) => {
+                let txid = tx.compute_txid().to_byte_array();
+                self.tx_requests.remove(&txid);
+                let _ = self.mempool_tx.send((bitcoin::consensus::serialize(&tx), Source::Peer));
+            }
+            NetworkMessage::GetData(inventory) => {
+                // Peers may ask for the transactions sent them.
+                for inv in inventory {
+                    if let Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) = inv
+                        && let Some((raw, _)) = self.ours.get(&txid.to_byte_array())
+                        && let Ok(tx) = bitcoin::consensus::deserialize(raw)
+                    {
+                        self.send(id, NetworkMessage::Tx(tx));
+                    }
                 }
             }
             NetworkMessage::Addr(addrs) => {
@@ -444,6 +488,7 @@ impl Node {
             self.maintain_peers();
             self.sync_headers();
             self.time_out_requests();
+            self.rebroadcast();
         }
         if self.best_changed {
             self.best_changed = false;
@@ -624,6 +669,58 @@ impl Node {
         }
         for (id, inventory) in asks {
             self.send(id, NetworkMessage::GetData(inventory));
+        }
+    }
+
+    /// Asks a peer for the transactions it announced that aren't known,
+    /// once the first sync is over.
+    fn ask_txs(&mut self, id: PeerId, inventory: &[Inventory]) {
+        if self.store.syncing() || self.store.snapshot().blocks == 0 {
+            return;
+        }
+        let mempool = self.mempool.read().unwrap();
+        let mut wanted = Vec::new();
+        for inv in inventory {
+            if let Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) = inv {
+                let txid = txid.to_byte_array();
+                if !mempool.contains(&txid) && !self.tx_requests.contains_key(&txid) {
+                    self.tx_requests.insert(txid, Instant::now());
+                    wanted.push(Inventory::WitnessTransaction(bitcoin::Txid::from_byte_array(txid)));
+                }
+            }
+        }
+        drop(mempool);
+        if !wanted.is_empty() {
+            self.send(id, NetworkMessage::GetData(wanted));
+        }
+    }
+
+    /// Sends a transaction sent to the API to every peer.
+    fn broadcast(&mut self, raw: Vec<u8>) {
+        let Ok(tx) = bitcoin::consensus::deserialize::<bitcoin::Transaction>(&raw) else { return };
+        let txid = tx.compute_txid();
+        tracing::info!("broadcasting {txid} to {} peers", self.peers.len());
+        for peer in self.peers.values() {
+            let _ = peer.commands.send(NetworkMessage::Tx(tx.clone()));
+        }
+        self.ours.insert(txid.to_byte_array(), (raw, Instant::now()));
+    }
+
+    /// Sends our transactions again every ten minutes until they're
+    /// confirmed, and forgets requests for transactions never sent.
+    fn rebroadcast(&mut self) {
+        self.tx_requests.retain(|_, at| at.elapsed() < Duration::from_secs(60));
+        let mempool = self.mempool.read().unwrap();
+        self.ours.retain(|txid, _| mempool.contains(txid));
+        drop(mempool);
+        let due: Vec<Vec<u8>> = self
+            .ours
+            .values()
+            .filter(|(_, at)| at.elapsed() > Duration::from_secs(600))
+            .map(|(raw, _)| raw.clone())
+            .collect();
+        for raw in due {
+            self.broadcast(raw);
         }
     }
 

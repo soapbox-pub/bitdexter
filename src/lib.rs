@@ -14,6 +14,7 @@ pub mod config;
 pub mod consensus;
 pub mod hash;
 pub mod indexer;
+pub mod mempool;
 pub mod network;
 pub mod node;
 pub mod p2p;

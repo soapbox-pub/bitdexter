@@ -106,8 +106,8 @@ fn version_message(addr: SocketAddr, start_height: i32) -> VersionMessage {
         nonce: rand::random(),
         user_agent: format!("/bitdexter:{}/", env!("CARGO_PKG_VERSION")),
         start_height,
-        // Transactions aren't relayed to us until there's a mempool to keep.
-        relay: false,
+        // Transactions are relayed to us, for the mempool.
+        relay: true,
     }
 }
 

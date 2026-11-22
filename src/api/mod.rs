@@ -18,6 +18,9 @@ use crate::store::Store;
 pub struct AppState {
     pub store: Arc<Store>,
     pub status: Arc<Mutex<Status>>,
+    pub mempool: crate::mempool::Shared,
+    /// Where transactions sent to the API go to be checked.
+    pub mempool_tx: std::sync::mpsc::Sender<(Vec<u8>, crate::mempool::Source)>,
 }
 
 /// An error to answer with: a status and plain text, as Esplora does.
@@ -67,6 +70,7 @@ async fn status(axum::extract::State(state): axum::extract::State<AppState>) -> 
         "headers": status.headers,
         "indexed": status.indexed,
         "syncing": state.store.syncing(),
+        "mempool": state.mempool.read().unwrap().len(),
         "disk_usage": usage,
     }))
 }
