@@ -30,6 +30,8 @@ network = "mainnet"            # mainnet, testnet4, signet or regtest
 # data_dir = "/var/lib/bitdexter"
 http = "127.0.0.1:3000"
 bulk_threshold = 1000          # index in bulk when this many blocks behind
+assume_valid = true            # skip scripts up to the assumevalid block
+blockbook = false              # serve Blockbook's API too
 
 [p2p]
 peers = []                     # always kept connected, as host:port
@@ -55,6 +57,23 @@ Unconfirmed transactions are served by `/tx/:txid` and the rest, and counted
 in addresses' `mempool_stats`, transactions and UTXOs, as Esplora does.
 
 Still to come: mempool.space's `/v1/prices`.
+
+### Blockbook
+
+With `blockbook = true` (or `--blockbook`), it serves
+[Blockbook's API](https://github.com/trezor/blockbook/blob/master/docs/api.md)
+too: over WebSocket at `/websocket`, `getInfo`, `getAccountInfo`,
+`getAccountUtxo`, `getTransaction`, `getBlock`, `getBlockHash`, `estimateFee`,
+`sendTransaction` and `ping`; and over REST, `/api/v2/xpub/:descriptor`,
+`/api/v2/address/:address`, `/api/v2/utxo/:descriptor`, `/api/v2/tx/:txid`,
+`/api/v2/block/:id`, `/api/v2/estimatefee/:blocks` and `/api/v2/sendtx`.
+
+An account is an extended public key (xpub, ypub or zpub, or their testnet
+forms) or an output descriptor of one: `pkh()`, `sh(wpkh())`, `wpkh()` or
+`tr()`, with or without its key origin, `/<0;1>/*` and checksum. Its receive
+and change addresses are derived in turn until 20 in a row are unused, and
+their history, balances and UTXOs, unconfirmed too, given at once. Fiat rates
+(`getCurrentFiatRates`) and subscriptions aren't served yet.
 
 ## Mempool
 
@@ -156,9 +175,7 @@ Not yet: signet's block signatures, and a minimum chain work for header sync.
 1. ~~Initial sync in bulk.~~ Done.
 2. ~~Script verification~~ Done.
 3. ~~Mempool~~ Done.
-4. **Blockbook's API**, optionally: REST and WebSocket, xpub and descriptor
-   scans (`getAccountInfo`, `getAccountUtxo`, `estimateFee`,
-   `sendTransaction`, …).
+4. ~~Blockbook's API~~ Done, but for fiat rates and subscriptions.
 5. **Silent payments**: BIP352 tweaks, served as BlindBit Oracle serves them.
 6. Prices for `/v1/prices`, the Electrum protocol, and packages.
 
