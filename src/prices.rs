@@ -14,6 +14,11 @@ pub const CURRENCIES: [&str; 7] = ["USD", "EUR", "GBP", "CAD", "CHF", "AUD", "JP
 const INTERVAL: Duration = Duration::from_secs(60);
 /// How old prices may get before they're not given at all.
 const STALE: u64 = 15 * 60;
+/// How far apart sources may be, as a fraction, for a currency to be
+/// priced: further, and one of them is wrong, and which isn't known.
+const MAX_SPREAD: f64 = 0.05;
+/// The largest answer read from an exchange.
+const MAX_BODY: usize = 1 << 20;
 
 #[derive(Debug, Clone)]
 pub struct Prices {
@@ -54,6 +59,11 @@ fn kraken(body: &Value) -> BTreeMap<&'static str, f64> {
 fn median(mut values: Vec<f64>) -> Option<f64> {
     values.retain(|v| v.is_finite() && *v > 0.0);
     values.sort_by(f64::total_cmp);
+    if let (Some(&low), Some(&high)) = (values.first(), values.last())
+        && high > low * (1.0 + MAX_SPREAD)
+    {
+        return None;
+    }
     match values.len() {
         0 => None,
         n if n % 2 == 1 => Some(values[n / 2]),
@@ -70,8 +80,15 @@ fn combine(sources: &[BTreeMap<&'static str, f64>]) -> BTreeMap<&'static str, f6
 }
 
 async fn fetch(client: &reqwest::Client, url: &str) -> Option<Value> {
-    let response = client.get(url).send().await.ok()?.error_for_status().ok()?;
-    serde_json::from_str(&response.text().await.ok()?).ok()
+    let mut response = client.get(url).send().await.ok()?.error_for_status().ok()?;
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.ok()? {
+        body.extend_from_slice(&chunk);
+        if body.len() > MAX_BODY {
+            return None;
+        }
+    }
+    serde_json::from_slice(&body).ok()
 }
 
 /// Polls the exchanges until shut down, keeping the latest in `shared`.
@@ -127,5 +144,12 @@ mod tests {
         assert_eq!(rates["EUR"], 90.0);
         assert_eq!(rates["AUD"], 150.0);
         assert!(!rates.contains_key("JPY"));
+    }
+
+    #[test]
+    fn sources_far_apart_price_nothing() {
+        let cb = coinbase(&json!({ "data": { "rates": { "USD": "100000" } } }));
+        let kr = kraken(&json!({ "result": { "XXBTZUSD": { "c": ["1e300", "1"] } } }));
+        assert!(!combine(&[cb, kr]).contains_key("USD"));
     }
 }
