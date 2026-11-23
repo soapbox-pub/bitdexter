@@ -644,9 +644,10 @@ pub type Want = (Option<PeerId>, Vec<Hash>);
 const SAVED_MAGIC: &[u8; 8] = b"BDXMEMP1";
 /// How often the mempool is saved.
 const SAVE_EVERY: Duration = Duration::from_secs(600);
-/// Orphans kept, at most, and for how long.
-const MAX_ORPHANS: usize = 5_000;
-const MAX_ORPHAN_BYTES: usize = 50 << 20;
+/// Orphans kept, at most, and for how long: enough for a whole mempool's
+/// chains, fetched in no particular order, as a bootstrap fetches them.
+const MAX_ORPHANS: usize = 100_000;
+const MAX_ORPHAN_BYTES: usize = 100 << 20;
 const MAX_ORPHAN_SIZE: usize = 100_000;
 const ORPHAN_LIFE: Duration = Duration::from_secs(20 * 60);
 

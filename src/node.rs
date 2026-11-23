@@ -94,6 +94,9 @@ pub struct MempoolLink {
 
 /// Transactions asked of a peer in one `getdata`, at most.
 const TX_ASK_BATCH: usize = 1000;
+/// How many peers a transaction wanted of any is asked of before giving up:
+/// peers relaying less than bitdexter does won't have it.
+const TX_ASK_TRIES: u8 = 8;
 
 struct Peer {
     info: PeerInfo,
@@ -150,8 +153,12 @@ pub struct Node {
     mempool_tx: std::sync::mpsc::Sender<(Vec<u8>, Source)>,
     relay: mpsc::UnboundedReceiver<Vec<u8>>,
     wants: mpsc::UnboundedReceiver<mempool::Want>,
-    /// Wanted of any peer, while there are none.
+    /// Wanted of any peer, to be asked for.
     wanted: Vec<crate::hash::Hash>,
+    /// How many peers each of those has been asked of, and when last.
+    wanted_tries: HashMap<crate::hash::Hash, (u8, Instant)>,
+    /// Which peer gets the next batch of them.
+    wanted_turn: usize,
     /// Those, until they're confirmed, to send again now and then.
     ours: HashMap<crate::hash::Hash, (Vec<u8>, Instant)>,
     /// Transactions asked of peers, and when.
@@ -235,6 +242,8 @@ impl Node {
             relay,
             wants,
             wanted: Vec::new(),
+            wanted_tries: HashMap::new(),
+            wanted_turn: 0,
             ours: HashMap::new(),
             tx_requests: HashMap::new(),
             store,
@@ -368,6 +377,7 @@ impl Node {
             NetworkMessage::Tx(tx) => {
                 let txid = tx.compute_txid().to_byte_array();
                 self.tx_requests.remove(&txid);
+                self.wanted_tries.remove(&txid);
                 let _ = self.mempool_tx.send((bitcoin::consensus::serialize(&tx), Source::Peer(Some(id))));
             }
             NetworkMessage::GetData(inventory) => {
@@ -396,6 +406,17 @@ impl Node {
                 }
             }
             NetworkMessage::NotFound(inventory) => {
+                // A transaction wanted of any peer is asked of the next.
+                let peers = self.peers.len().min(TX_ASK_TRIES as usize) as u8;
+                for inv in &inventory {
+                    if let Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) = inv {
+                        let txid = txid.to_byte_array();
+                        self.tx_requests.remove(&txid);
+                        if self.wanted_tries.get(&txid).is_some_and(|(tries, _)| *tries < peers) {
+                            self.wanted.push(txid);
+                        }
+                    }
+                }
                 for inv in inventory {
                     if let Inventory::WitnessBlock(hash) | Inventory::Block(hash) = inv
                         && let Some(request) = self.requested.remove(&hash)
@@ -753,16 +774,20 @@ impl Node {
         if self.peers.is_empty() || self.wanted.is_empty() {
             return;
         }
-        let ids: Vec<PeerId> = self.peers.keys().copied().collect();
+        let mut ids: Vec<PeerId> = self.peers.keys().copied().collect();
+        ids.sort_unstable();
         let wanted = std::mem::take(&mut self.wanted);
         tracing::debug!("asking {} peers for {} transactions", ids.len(), wanted.len());
-        for (i, batch) in wanted.chunks(TX_ASK_BATCH).enumerate() {
+        for batch in wanted.chunks(TX_ASK_BATCH) {
             for txid in batch {
                 self.tx_requests.insert(*txid, Instant::now());
+                let tries = self.wanted_tries.entry(*txid).or_insert((0, Instant::now()));
+                *tries = (tries.0 + 1, Instant::now());
             }
             let inventory =
                 batch.iter().map(|txid| Inventory::WitnessTransaction(bitcoin::Txid::from_byte_array(*txid))).collect();
-            self.send(ids[i % ids.len()], NetworkMessage::GetData(inventory));
+            self.wanted_turn = self.wanted_turn.wrapping_add(1);
+            self.send(ids[self.wanted_turn % ids.len()], NetworkMessage::GetData(inventory));
         }
     }
 
@@ -797,6 +822,7 @@ impl Node {
     /// confirmed, and forgets requests for transactions never sent.
     fn rebroadcast(&mut self) {
         self.tx_requests.retain(|_, at| at.elapsed() < Duration::from_secs(60));
+        self.wanted_tries.retain(|_, (_, at)| at.elapsed() < Duration::from_secs(600));
         let mempool = self.mempool.read().unwrap();
         self.ours.retain(|txid, _| mempool.contains(txid));
         drop(mempool);
