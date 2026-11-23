@@ -89,6 +89,10 @@ pub const REORG_DEPTH: u32 = 100;
 
 /// The format the files are in, bumped when it changes.
 const FORMAT: u32 = 4;
+/// Format 3 differs from 4 only in the txid table, keyed then by a txid's
+/// first 8 bytes: a store in it is brought up to date by building the
+/// table again, as it's opened.
+const FORMAT_UNKEYED: u32 = 3;
 
 fn read_le(bytes: &[u8]) -> u64 {
     let mut buf = [0u8; 8];
@@ -305,10 +309,15 @@ impl State {
         out
     }
 
-    fn decode(bytes: &[u8]) -> Result<State> {
+    /// The state, and the format it's in: [`FORMAT`] or one it can be
+    /// brought up to.
+    fn decode(bytes: &[u8]) -> Result<(State, u32)> {
         anyhow::ensure!(bytes.len() >= 4, "the store's state is corrupt");
         let format = read_le(&bytes[..4]) as u32;
-        anyhow::ensure!(format == FORMAT, "the store is in format {format}, not {FORMAT}: it must be rebuilt");
+        anyhow::ensure!(
+            format == FORMAT || format == FORMAT_UNKEYED,
+            "the store is in format {format}, not {FORMAT}: it must be rebuilt"
+        );
         anyhow::ensure!(bytes.len() == 6 + 28 * 3 + 24, "the store's state is corrupt");
         let mode = match bytes[4] {
             0 => Mode::Tip,
@@ -316,7 +325,7 @@ impl State {
             2 => Mode::Finalizing,
             _ => anyhow::bail!("the store's state is corrupt"),
         };
-        Ok(State {
+        let state = State {
             mode,
             dirty: bytes[5] != 0,
             counts: Snapshot::decode(&bytes[6..34]),
@@ -325,7 +334,8 @@ impl State {
             spends_logged: read_le(&bytes[90..98]),
             history_logged: read_le(&bytes[98..106]),
             static_outs: read_le(&bytes[106..114]),
-        })
+        };
+        Ok((state, format))
     }
 }
 

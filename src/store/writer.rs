@@ -85,10 +85,13 @@ impl Writer {
             let keyer = txn.get(meta, b"txid key")?.map(Keyer::from_bytes);
             (state, keyer)
         };
-        // The txid table's secret, made with the store.
+        let migrating = state.is_some_and(|(_, format)| format == FORMAT_UNKEYED);
+        let state = state.map(|(state, _)| state);
+        // The txid table's secret, made with the store, or as it's brought
+        // up to date (and kept if that's cut short, to finish with).
         let keyer = match (state, keyer) {
             (_, Some(Some(keyer))) => keyer,
-            (None, None) => {
+            (_, None) if state.is_none() || migrating => {
                 let keyer = Keyer::random();
                 let mut txn = env.write_txn()?;
                 txn.put(meta, b"txid key", &keyer.to_bytes(), false)?;
@@ -154,6 +157,11 @@ impl Writer {
             last_commit: Instant::now(),
             rebuilt_in_block: false,
         };
+        if migrating {
+            tracing::warn!("bringing the store up to format {FORMAT}: building the txid table again, keyed");
+            writer.rebuild_table(counts.txs)?;
+            writer.write_state()?;
+        }
         match state.mode {
             Mode::Tip if state.dirty => writer.recover()?,
             Mode::Tip => {}

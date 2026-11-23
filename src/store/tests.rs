@@ -198,3 +198,49 @@ fn locks_and_recovers_a_disconnect_cut_short() {
     drop(writer);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// A store in format 3, whose txid table was keyed by txids' first bytes,
+/// is brought up to date as it's opened: the table's built again, under
+/// a secret, and everything's found as before.
+#[test]
+fn brings_format_3_up_to_date() {
+    let dir = std::env::temp_dir().join(format!("bitdexter-store-{}-format3", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut writer = Store::open(&dir, Chain::Regtest).unwrap();
+    let mut chain = TestChain::new();
+    connect(&mut writer, &chain.blocks[0], true).unwrap();
+    for _ in 0..5 {
+        let block = chain.block(vec![]);
+        connect(&mut writer, &block, true).unwrap();
+        chain.blocks.push(block);
+    }
+    writer.commit().unwrap();
+    drop(writer);
+
+    // As format 3 left it: its state says so, and there's no secret.
+    {
+        let env = lmdb::Env::open(&dir.join("index"), 1 << 30, 4).unwrap();
+        let meta = env.create_db("meta", false).unwrap();
+        let mut txn = env.write_txn().unwrap();
+        let mut state = txn.get(meta, b"state").unwrap().unwrap().to_vec();
+        state[..4].copy_from_slice(&FORMAT_UNKEYED.to_le_bytes());
+        txn.put(meta, b"state", &state, false).unwrap();
+        txn.del(meta, b"txid key", None).unwrap();
+        txn.commit().unwrap();
+    }
+
+    let writer = Store::open(&dir, Chain::Regtest).unwrap();
+    for (height, block) in chain.blocks.iter().enumerate() {
+        let txid = block.txdata[0].compute_txid().to_byte_array();
+        let txnum = writer.store.txnum(&txid).expect("found after the table's built again");
+        assert_eq!(writer.store.tx_height(txnum), height as u32);
+    }
+    let keyer = writer.store.table().keyer();
+    drop(writer);
+    // Reopened, it's format 4, with the same secret.
+    let writer = Store::open(&dir, Chain::Regtest).unwrap();
+    assert_eq!(writer.store.table().keyer(), keyer);
+    assert_eq!(writer.state.encode()[..4], FORMAT.to_le_bytes());
+    drop(writer);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
