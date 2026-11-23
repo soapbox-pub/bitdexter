@@ -500,6 +500,7 @@ impl Node {
         let mut status = self.status.lock().unwrap();
         status.peers = self.peers.len();
         status.headers = self.headers.tip_height();
+        status.indexed = self.indexed;
     }
 
     fn maintain_peers(&mut self) {
