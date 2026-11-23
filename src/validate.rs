@@ -64,21 +64,23 @@ fn witness_commitment(block: &Block<'_>) -> Option<Hash> {
         .map(|out| out.script[6..38].try_into().unwrap())
 }
 
+/// Checks a block, in Bitcoin Core's order: first that its transactions
+/// and their witnesses are the ones its header commits to, so that a peer
+/// can't make a good block look bad by sending it with transactions added,
+/// left out or padded (those are all "mutations", which say nothing about
+/// the block itself), and only then everything else.
 pub fn check_block(block: &Block<'_>, height: u32, chain: Chain) -> Result<(), Invalid> {
     let txs = &block.txs;
-    if txs.is_empty() {
-        return invalid("bad-blk-length");
-    }
-    if block.base_size() * 4 > MAX_BLOCK_WEIGHT || block.weight() > MAX_BLOCK_WEIGHT {
-        return invalid("bad-blk-weight");
-    }
-
+    // No transactions give a root of zeros, which no header commits to.
     let (root, mutated) = merkle_root(txs.iter().map(|tx| tx.txid).collect());
     if root != block.merkle_root() {
         return invalid("bad-txnmrklroot");
     }
     if mutated {
         return invalid("bad-txns-duplicate");
+    }
+    if txs.is_empty() || block.base_size() * 4 > MAX_BLOCK_WEIGHT {
+        return invalid("bad-blk-length");
     }
 
     if !txs[0].is_coinbase() {
@@ -147,6 +149,10 @@ pub fn check_block(block: &Block<'_>, height: u32, chain: Chain) -> Result<(), I
         None if has_witness => return invalid("unexpected-witness"),
         None => {}
     }
+    // Only now are the witnesses known to be the block's own.
+    if block.weight() > MAX_BLOCK_WEIGHT {
+        return invalid("bad-blk-weight");
+    }
     Ok(())
 }
 
@@ -173,5 +179,38 @@ mod tests {
             let raw = bitcoin::consensus::serialize(&block);
             check_block(&parse_block(&raw).unwrap(), 0, chain).unwrap();
         }
+    }
+
+    /// A good block sent with its transactions left out or padded past the
+    /// size limit fails as mutated, not as too small or too big, which
+    /// would mark the block itself invalid.
+    #[test]
+    fn emptied_or_padded_blocks_are_mutated() {
+        use bitcoin::hashes::Hash as _;
+        let block = bitcoin::constants::genesis_block(bitcoin::Network::Bitcoin);
+        let raw = bitcoin::consensus::serialize(&block);
+
+        let mut empty = raw[..80].to_vec();
+        empty.push(0);
+        let err = check_block(&parse_block(&empty).unwrap(), 0, Chain::Mainnet).unwrap_err();
+        assert_eq!(err.0, "bad-txnmrklroot");
+
+        let mut padded = block.clone();
+        let junk = bitcoin::Transaction {
+            version: bitcoin::transaction::Version::ONE,
+            lock_time: bitcoin::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: bitcoin::OutPoint { txid: bitcoin::Txid::from_byte_array([1; 32]), vout: 0 },
+                ..Default::default()
+            }],
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::ZERO,
+                script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x6a; 500_000]),
+            }],
+        };
+        padded.txdata.extend(std::iter::repeat_n(junk, 3));
+        let raw = bitcoin::consensus::serialize(&padded);
+        let err = check_block(&parse_block(&raw).unwrap(), 0, Chain::Mainnet).unwrap_err();
+        assert_eq!(err.0, "bad-txnmrklroot");
     }
 }
