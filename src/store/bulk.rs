@@ -226,8 +226,9 @@ impl Bulk {
             spends,
             history,
         };
-        writer.outs.map().will_need(0, (counts.outs * OUT_WIDTH as u64) as usize);
+        let mut ahead = writer.outs.read_ahead(0, counts.outs);
         for outnum in 0..counts.outs {
+            ahead.at(outnum);
             let out = decode_out(writer.outs.get(outnum));
             if !out.spendable || out.spent.is_some() {
                 bulk.set_spent(outnum);
@@ -237,10 +238,12 @@ impl Bulk {
             bulk.set_spent(read_u40(record));
             Ok(())
         })?;
-        writer.txids.map().will_need(0, (counts.txs * 32) as usize);
-        writer.txidx.map().will_need(0, (counts.txs * TXIDX_WIDTH as u64) as usize);
+        let mut txids_ahead = writer.txids.read_ahead(1, counts.txs);
+        let mut txidx_ahead = writer.txidx.read_ahead(1, counts.txs);
         // The genesis block's coinbase was never spendable.
         for txnum in 1..counts.txs {
+            txids_ahead.at(txnum);
+            txidx_ahead.at(txnum);
             let (first, next) = writer.outputs_of(txnum);
             let left = (first..next).filter(|&outnum| !bulk.is_spent(outnum)).count() as u64;
             if left > 0 {
@@ -619,9 +622,10 @@ pub fn build_table(txids: &ColumnWriter, count: u64, path: &Path, sort_dir: &Pat
 }
 
 fn try_build_table(txids: &ColumnWriter, count: u64, path: &Path, sort_dir: &Path, capacity: u64) -> Result<bool> {
-    txids.map().will_need(0, (count * 32) as usize);
+    let mut ahead = txids.read_ahead(0, count);
     let mut parts = Partitions::create(sort_dir, "txids", 256, 13)?;
     for txnum in 0..count {
+        ahead.at(txnum);
         let txid: Hash = txids.get(txnum).try_into().unwrap();
         let key = key_of(&txid);
         let mut record = [0u8; 13];

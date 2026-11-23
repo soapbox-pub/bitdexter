@@ -474,8 +474,9 @@ impl Writer {
         let counts = self.state.counts;
         tracing::warn!("the store wasn't committed cleanly; recovering it to block {}", counts.blocks);
         let started = Instant::now();
-        self.outs.map().will_need(0, (counts.outs * OUT_WIDTH as u64) as usize);
+        let mut ahead = self.outs.read_ahead(0, counts.outs);
         for outnum in 0..counts.outs {
+            ahead.at(outnum);
             if decode_out(self.outs.get(outnum)).spent.is_some_and(|by| by >= counts.txs) {
                 self.outs.set(outnum, VALUE_BYTES, &[0; 5]);
             }

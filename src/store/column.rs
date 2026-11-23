@@ -11,7 +11,7 @@
 //! the hundred kilobytes or more around it it would otherwise. Reading
 //! scripts to verify a block's inputs, on mainnet, that's the difference
 //! between reading a gigabyte from disk a block and a few megabytes. Scans
-//! in order ask for read-ahead with [`Map::will_need`].
+//! in order read ahead a window at a time with [`ReadAhead`].
 //!
 //! Readers are bounded by the counts of the store's last commit, so they
 //! never read past what's in the file. A column is shortened (on a reorg)
@@ -63,6 +63,32 @@ impl Map {
         // SAFETY: madvise only advises; the range is within the reservation.
         unsafe {
             libc::madvise(self.ptr(start) as *mut libc::c_void, len, libc::MADV_WILLNEED);
+        }
+    }
+}
+
+/// How far ahead a scan in order asks for its column to be read.
+const WINDOW: u64 = 64 << 20;
+
+/// Reads a column ahead of a scan in order, a window at a time, so the
+/// scan's faults find their pages read already. Asking for a whole column
+/// at once would read more than memory holds on mainnet, evicting each page
+/// before the scan got to it.
+pub struct ReadAhead {
+    map: Arc<Map>,
+    /// The end of what's been asked for, and of the scan, in bytes.
+    asked: u64,
+    end: u64,
+}
+
+impl ReadAhead {
+    /// Notes that the scan has reached record `index`.
+    pub fn at(&mut self, index: u64) {
+        let offset = index * self.map.width as u64;
+        if self.asked < self.end && offset + WINDOW / 2 >= self.asked {
+            let len = WINDOW.min(self.end - self.asked);
+            self.map.will_need(self.asked, len as usize);
+            self.asked += len;
         }
     }
 }
@@ -194,6 +220,12 @@ impl ColumnWriter {
 
     pub fn map(&self) -> &Map {
         &self.map
+    }
+
+    /// Read-ahead for a scan of records `from..to`, in order.
+    pub fn read_ahead(&self, from: u64, to: u64) -> ReadAhead {
+        let width = self.width as u64;
+        ReadAhead { map: self.map.clone(), asked: from * width, end: to.min(self.flushed) * width }
     }
 }
 
