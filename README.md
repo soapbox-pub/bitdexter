@@ -174,6 +174,39 @@ and wrote 29 GB to disk. Merging 38 million transactions and 99 million
 outputs at the end took 11 seconds. (Indexing in place throughout, as the
 first version did, took 157% of the raw size and wrote 128 GB.)
 
+Synced all of mainnet from peers, to block 977,181 (November 2026), on a
+Proxmox container with 16 cores, 32 then 64 GB of memory and SATA SSDs in
+RAID 10:
+
+| | Size |
+|---|---:|
+| `txdata` | 612 GB |
+| `txids`, `txidx`, `outs`, `blocks` | 112 GB |
+| `history` | 22.6 GB (6 bytes an output, 3.7 billion of them) |
+| `txid.table` | 14.2 GB (10 bytes a transaction, 1.48 billion of them) |
+| **Total** | **710 GB** |
+
+The first 500,000 blocks took 52 minutes, the next 300,000 three hours, and
+blocks 800,000 to 950,000 eleven hours, slowing to two to five blocks a
+second as reads of `outs`, `txidx` and `txdata` at random each read a
+hundred kilobytes or more around them. Above the assumevalid block, where
+each input's script is read too, that came to a gigabyte read from disk a
+block, and one block a second. Advising the maps as read at random fixed it:
+2–3 blocks a second with every script verified, reading 11 MB/s. (Below the
+assumevalid block it hasn't been measured since.) Merging the bulk index,
+1.42 billion transactions and 3.6 billion outputs, took 22 minutes; a second
+merge, of 14,000 blocks more, 9.5 minutes. Restarting in bulk rebuilds its map
+of the 115 million transactions with outputs left to spend in 3.5 minutes; at
+the tip, the API is up in 12 seconds. About 1.1 TB was written in all.
+
+At the tip, blocks, transactions, outspends, merkle proofs and addresses
+compared with mempool.space all match, busy ones too. An address's history
+takes about a second for one with tens of thousands of transactions, 13 for
+the genesis block's. The mempool is far smaller than mempool.space's (1,800
+transactions minutes after a restart against its 70,000): transactions are
+fetched only as peers announce them, so those already waiting aren't, and a
+child that arrives before its parent is dropped.
+
 Synced from testnet4's peers to its tip, 162,719 blocks and 15 million
 transactions, in 13 minutes, merging the bulk index in 5 seconds, then
 following it in place, reorgs too. Blocks, transactions, outspends, merkle
@@ -213,7 +246,9 @@ Not yet: signet's block signatures, and a minimum chain work for header sync.
 4. ~~Blockbook's API~~ Done, but for fiat rates and subscriptions.
 5. ~~Silent payments~~ Done.
 6. ~~Prices~~ Done.
-7. A full mainnet sync measured end to end; faster downloads from peers.
+7. ~~A full mainnet sync measured end to end~~ Done. Faster downloads from
+   peers; filling the mempool from peers' (BIP35 `mempool`, or saving it) and
+   keeping orphans until their parents arrive.
 8. ~~The Electrum protocol~~ Done. Packages.
 
 ## Testing
