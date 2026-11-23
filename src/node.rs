@@ -54,6 +54,14 @@ const HEADERS_TIMEOUT: Duration = Duration::from_secs(30);
 /// How often a peer is asked for headers anyway, in case an announcement
 /// was missed.
 const HEADERS_POLL: Duration = Duration::from_secs(120);
+/// The largest transaction taken from a peer: none bigger is standard.
+const MAX_TX_SIZE: usize = 400_000;
+/// The most transactions asked of peers and not yet sent, at once: enough
+/// for a whole mempool, asked of a peer with BIP35.
+const MAX_TX_REQUESTS: usize = 200_000;
+/// The most transactions asked of one peer for one announcement, as many
+/// as Bitcoin Core puts in one.
+const MAX_TX_ASKS: usize = 50_000;
 
 #[derive(Debug, Clone)]
 pub struct NodeConfig {
@@ -84,9 +92,9 @@ pub struct Status {
 pub struct MempoolLink {
     pub shared: mempool::Shared,
     /// Where transactions from peers go to be checked.
-    pub check: std::sync::mpsc::Sender<(Vec<u8>, Source)>,
+    pub check: mempool::Submit,
     /// Transactions sent to the API and accepted, to send to peers.
-    pub relay: mpsc::UnboundedReceiver<Vec<u8>>,
+    pub relay: mpsc::Receiver<Vec<u8>>,
     /// Transactions to ask peers for: orphans' parents, and those another
     /// server's mempool has (see `mempool_bootstrap`).
     pub wants: mpsc::UnboundedReceiver<mempool::Want>,
@@ -150,8 +158,10 @@ pub struct Node {
     avg_block: f64,
     last_upkeep: Instant,
     mempool: mempool::Shared,
-    mempool_tx: std::sync::mpsc::Sender<(Vec<u8>, Source)>,
-    relay: mpsc::UnboundedReceiver<Vec<u8>>,
+    /// Where transactions from peers go to be checked.
+    mempool_tx: mempool::Submit,
+    /// Transactions sent to the API and accepted, to send to peers.
+    relay: mpsc::Receiver<Vec<u8>>,
     wants: mpsc::UnboundedReceiver<mempool::Want>,
     /// Wanted of any peer, to be asked for.
     wanted: Vec<crate::hash::Hash>,
@@ -375,10 +385,17 @@ impl Node {
                 self.ask_txs(id, &inventory);
             }
             NetworkMessage::Tx(tx) => {
+                // Only those asked for: anything else could be sent without end.
                 let txid = tx.compute_txid().to_byte_array();
-                self.tx_requests.remove(&txid);
+                if self.tx_requests.remove(&txid).is_none() {
+                    return;
+                }
                 self.wanted_tries.remove(&txid);
-                let _ = self.mempool_tx.send((bitcoin::consensus::serialize(&tx), Source::Peer(Some(id))));
+                let raw = bitcoin::consensus::serialize(&tx);
+                if raw.len() <= MAX_TX_SIZE {
+                    // If the mempool's thread is behind, it goes without.
+                    let _ = self.mempool_tx.try_send((raw, Source::Peer(Some(id))));
+                }
             }
             NetworkMessage::GetData(inventory) => {
                 // Peers may ask for the transactions sent them.
@@ -729,6 +746,9 @@ impl Node {
         for inv in inventory {
             if let Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) = inv {
                 let txid = txid.to_byte_array();
+                if wanted.len() >= MAX_TX_ASKS || self.tx_requests.len() >= MAX_TX_REQUESTS {
+                    break;
+                }
                 if !mempool.contains(&txid) && !self.tx_requests.contains_key(&txid) {
                     self.tx_requests.insert(txid, Instant::now());
                     wanted.push(Inventory::WitnessTransaction(bitcoin::Txid::from_byte_array(txid)));

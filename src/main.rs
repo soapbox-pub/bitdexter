@@ -114,7 +114,7 @@ async fn main() -> Result<()> {
         assume_valid: config.assume_valid,
     };
     let mempool = bitdexter::mempool::Shared::default();
-    let (relay_tx, relay_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (relay_tx, relay_rx) = tokio::sync::mpsc::channel(1000);
     let (wants_tx, wants_rx) = tokio::sync::mpsc::unbounded_channel();
     let saved_mempool = dir.join("mempool.dat");
     let mempool_tx = bitdexter::mempool::spawn(

@@ -5,11 +5,14 @@
 //! the chain as committed and the transactions already here: its inputs
 //! exist, unspent, coinbases mature; it makes no coins; its lock times have
 //! passed; its sigops are few enough; and its scripts pass. Bitcoin Core's
-//! policy is followed where it matters to relay: the minimum relay fee rate,
-//! the largest standard transaction, and replace-by-fee (full RBF, as Core's
-//! default since version 28): a transaction spending what one here spends
-//! replaces it, and everything spending that, if it pays more in all, by
-//! the incremental relay fee for its size, and at a higher rate than each.
+//! policy is followed where it matters to relay and to what miners will
+//! take: the minimum relay fee rate, and the mempool's own minimum once
+//! it's been full; standard transactions only (versions, output scripts,
+//! dust, input scripts); at most 25 unconfirmed ancestors and descendants;
+//! and replace-by-fee (full RBF, as Core's default since version 28): a
+//! transaction spending what one here spends replaces it, and everything
+//! spending that, at most 100 of them, if it pays more in all, by the
+//! incremental relay fee for its size, and at a higher rate than each.
 //! A transaction whose inputs aren't known (an orphan) is kept aside for a
 //! while, and its missing parents asked for from the peer that sent it; it's
 //! tried again once they arrive. Peers announce only transactions new to
@@ -18,11 +21,18 @@
 //!
 //! As blocks are committed, the transactions they confirm leave, and so do
 //! those spending what they spend, and everything spending those. If the
-//! chain reorganizes, every transaction is checked again. When it's over
-//! its size, those paying the lowest rate leave first.
+//! chain reorganizes, every transaction is checked again. When it takes
+//! more memory than it may, those paying the lowest rate leave first, and
+//! after two weeks, any.
+//!
+//! Only the mempool's own thread changes it. It checks a transaction
+//! holding only a read lock, which keeps no reader waiting, and takes the
+//! write lock just to add it; readers never queue behind it either, as it
+//! waits for the lock to be free rather than asking for it.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::block::{Tx, parse_tx};
@@ -38,10 +48,35 @@ use crate::verify::{TxCheck, verify_scripts};
 pub const MIN_RELAY_FEERATE: u64 = 100;
 /// What a replacement must pay for its size on top of what it replaces.
 pub const INCREMENTAL_FEERATE: u64 = 100;
+/// The rate dust is figured at, as Core's `-dustrelayfee`.
+const DUST_RELAY_FEERATE: u64 = 3000;
 const MAX_STANDARD_TX_WEIGHT: usize = 400_000;
 const MAX_STANDARD_TX_SIGOPS_COST: u64 = 16_000;
-/// The most bytes of transactions kept.
+const MAX_STANDARD_SCRIPTSIG_SIZE: usize = 1650;
+const MAX_P2SH_SIGOPS: usize = 15;
+const MAX_STANDARD_P2WSH_SCRIPT_SIZE: usize = 3600;
+const MAX_STANDARD_P2WSH_STACK_ITEMS: usize = 100;
+const MAX_STANDARD_P2WSH_STACK_ITEM_SIZE: usize = 80;
+/// The most unconfirmed ancestors, and descendants, a transaction may
+/// have, itself counted, as Core's defaults.
+const MAX_ANCESTORS: usize = 25;
+const MAX_DESCENDANTS: usize = 25;
+/// The most transactions one may replace, as Core's.
+const MAX_REPLACEMENTS: usize = 100;
+/// The most memory the transactions here may take, as figured by
+/// [`Entry::footprint`].
 const MAX_BYTES: usize = 300 << 20;
+/// How long a transaction may stay unconfirmed, as Core's `-mempoolexpiry`.
+const EXPIRY: u64 = 14 * 24 * 3600;
+/// How long the minimum fee rate takes to halve once the mempool's no
+/// longer full, as Core's.
+const MIN_FEE_HALFLIFE: f64 = 12.0 * 3600.0;
+/// The most changes kept for [`Mempool::changed_since`].
+const MAX_CHANGES: usize = 200_000;
+/// The most transactions waiting to be checked.
+const QUEUE: usize = 1000;
+/// The most refused transactions remembered, so as not to check them again.
+const MAX_REFUSED: usize = 100_000;
 
 /// Why a transaction was refused, with the error code Bitcoin Core's
 /// `sendrawtransaction` gives for it.
@@ -52,7 +87,7 @@ pub struct Reject {
 }
 
 impl Reject {
-    fn new(code: i32, reason: impl Into<String>) -> Reject {
+    pub fn new(code: i32, reason: impl Into<String>) -> Reject {
         Reject { code, reason: reason.into() }
     }
 
@@ -62,6 +97,12 @@ impl Reject {
 
     fn missing() -> Reject {
         Reject::new(-25, "bad-txns-inputs-missingorspent")
+    }
+
+    /// Whether the same transaction might be accepted later without the
+    /// chain changing: if its inputs turn up, or there's room.
+    fn may_pass_later(&self) -> bool {
+        self.code == -25 || self.code == -28 || self.reason == "mempool full" || self.reason == "txn-already-in-mempool"
     }
 }
 
@@ -110,6 +151,47 @@ impl Entry {
     pub fn tx(&self) -> Tx<'_> {
         parse_tx(&self.raw).expect("a transaction accepted")
     }
+
+    /// About how many bytes of memory it takes, with its place in each
+    /// index. It mustn't change while it's here.
+    fn footprint(&self) -> usize {
+        const ENTRY: usize = 512;
+        const PER_INPUT: usize = 208;
+        const PER_OUTPUT: usize = 96;
+        ENTRY
+            + self.raw.len()
+            + self.prevouts.iter().map(|p| PER_INPUT + p.script.len()).sum::<usize>()
+            + self.outputs.iter().map(|(_, s)| PER_OUTPUT + s.len()).sum::<usize>()
+    }
+}
+
+/// A transaction checked and ready to be added.
+pub struct Checked {
+    entry: Entry,
+    /// What it replaces.
+    replaced: HashSet<Hash>,
+    /// The mempool's generation when it was checked.
+    generation: u64,
+}
+
+/// A transaction that arrived lately, for `/mempool/recent`.
+#[derive(Debug, Clone)]
+pub struct Recent {
+    pub txid: Hash,
+    pub fee: u64,
+    pub vsize: u64,
+    pub value: u64,
+}
+
+/// What's figured from the whole mempool, figured again at most once a
+/// second rather than for every request.
+#[derive(Debug, Clone, Default)]
+pub struct Summary {
+    /// The lowest rate in each block the transactions here would fill,
+    /// highest rate first, in sat/kvB.
+    lowest: Vec<u64>,
+    histogram: Vec<(f64, u64)>,
+    recent: Vec<Recent>,
 }
 
 #[derive(Default)]
@@ -120,12 +202,25 @@ pub struct Mempool {
     /// The transactions paying, and spending, each script key.
     funding: HashMap<[u8; 8], HashSet<Hash>>,
     spending: HashMap<[u8; 8], HashSet<Hash>>,
+    /// The transactions by fee rate, lowest first, and by arrival.
+    by_rate: BTreeSet<(u64, Hash)>,
+    by_seq: BTreeMap<u64, Hash>,
     bytes: usize,
     vsize: u64,
     fees: u64,
     seq: u64,
     /// The block the transactions were last checked against.
     synced: Option<(u32, Hash)>,
+    /// Counts changes. Each change's script keys are kept, in
+    /// `changes`, from generation `changes_from` on.
+    generation: u64,
+    changes: VecDeque<(u64, [u8; 8])>,
+    changes_from: u64,
+    /// The rate below which nothing's taken since the mempool was last
+    /// full, in sat/kvB, and when it was set.
+    min_feerate: (f64, u64),
+    summary: Arc<Summary>,
+    summary_generation: u64,
     pub stats: Stats,
 }
 
@@ -174,6 +269,20 @@ impl Mempool {
         self.txs.values()
     }
 
+    /// Counts the changes made, for [`Mempool::changed_since`].
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// The script keys paid or spent by transactions added or removed
+    /// since `generation`, or `None` if that's too long ago to know.
+    pub fn changed_since(&self, generation: u64) -> Option<HashSet<[u8; 8]>> {
+        if generation < self.changes_from {
+            return None;
+        }
+        Some(self.changes.iter().filter(|(g, _)| *g > generation).map(|(_, key)| *key).collect())
+    }
+
     /// The transaction here spending an outpoint, and which of its inputs
     /// does.
     pub fn spender(&self, txid: &Hash, vout: u32) -> Option<(Hash, usize)> {
@@ -194,47 +303,40 @@ impl Mempool {
         entries
     }
 
-    /// The `n` transactions that arrived last.
-    pub fn recent(&self, n: usize) -> Vec<&Entry> {
-        let mut entries: Vec<&Entry> = self.txs.values().collect();
-        entries.sort_unstable_by_key(|e| std::cmp::Reverse(e.seq));
-        entries.truncate(n);
-        entries
+    /// The transactions that arrived last, as of the last summary.
+    pub fn recent(&self) -> Vec<Recent> {
+        self.summary.recent.clone()
     }
 
-    /// Accepts a transaction, as of the chain `store` has committed.
-    /// Returns its txid.
-    pub fn accept(&mut self, store: &Store, raw: Vec<u8>) -> Result<Hash, Reject> {
-        self.accept_at(store, raw, now())
+    /// The fee rate, in sat/kvB, below which nothing's taken now.
+    fn min_feerate(&self, now: u64) -> u64 {
+        let (rate, since) = self.min_feerate;
+        let halvings = now.saturating_sub(since) as f64 / MIN_FEE_HALFLIFE;
+        let rate = rate / 2f64.powf(halvings);
+        // As Core, it drops to nothing once it's under half the increment.
+        let rate = if rate < INCREMENTAL_FEERATE as f64 / 2.0 { 0 } else { rate.ceil() as u64 };
+        rate.max(MIN_RELAY_FEERATE)
     }
 
-    /// Accepts a transaction that arrived at `time`, in seconds since 1970.
-    pub fn accept_at(&mut self, store: &Store, raw: Vec<u8>, time: u64) -> Result<Hash, Reject> {
-        let result = self.check_and_insert(store, raw, time);
-        match &result {
-            Ok(_) => self.stats.accepted += 1,
-            Err(reject) => {
-                let reason = reject.reason.split(" (").next().unwrap_or_default().to_string();
-                *self.stats.refused.entry(reason).or_default() += 1;
-            }
-        }
-        result
-    }
-
-    fn check_and_insert(&mut self, store: &Store, raw: Vec<u8>, time: u64) -> Result<Hash, Reject> {
-        self.sync(store);
+    /// Checks a transaction, as of the chain `store` has committed, for
+    /// [`Mempool::add`]. This is the slow part, scripts and all, and needs
+    /// only a read lock.
+    /// `time` is when it arrived, in seconds since 1970.
+    pub fn check(&self, store: &Store, raw: Vec<u8>, time: u64) -> Result<Checked, Reject> {
         let tx = parse_tx(&raw).map_err(|err| Reject::new(-22, format!("TX decode failed: {err}")))?;
         let txid = tx.txid;
         if self.txs.contains_key(&txid) {
             return Err(Reject::new(-26, "txn-already-in-mempool"));
         }
+        check_tx(&tx)?;
+        check_standard(&tx)?;
         let snapshot = store.snapshot();
         let Some(tip) = snapshot.tip_height() else { return Err(Reject::new(-28, "not synced")) };
         if store.coin(&txid, 0, &snapshot).is_some() {
             return Err(Reject::new(-27, "Transaction outputs already in utxo set"));
         }
-        check_tx(&tx)?;
         let height = tip + 1;
+        let vsize = (tx.weight() as u64).div_ceil(4);
 
         let mut prevouts = Vec::with_capacity(tx.inputs.len());
         let mut parents = HashSet::new();
@@ -280,6 +382,14 @@ impl Mempool {
             return Err(Reject::invalid("bad-txns-in-belowout"));
         }
         let fee = value_in - value_out;
+        let feerate = fee * 1000 / vsize;
+        if fee * 1000 < MIN_RELAY_FEERATE * vsize {
+            return Err(Reject::new(-26, "min relay fee not met"));
+        }
+        if feerate < self.min_feerate(now()) {
+            return Err(Reject::new(-26, "mempool min fee not met"));
+        }
+        check_inputs_standard(&tx, &prevouts)?;
 
         let mtp = store.mtp(tip);
         let chain = store.chain;
@@ -296,55 +406,138 @@ impl Mempool {
             return Err(Reject::invalid("bad-txns-too-many-sigops"));
         }
 
-        let vsize = (tx.weight() as u64).div_ceil(4);
-        if fee * 1000 < MIN_RELAY_FEERATE * vsize {
-            return Err(Reject::new(-26, "min relay fee not met"));
-        }
         let replaced = self.with_descendants(&conflicts);
         if !replaced.is_empty() {
             if parents.iter().any(|p| replaced.contains(p)) {
                 return Err(Reject::invalid("bad-txns-spends-conflicting-tx"));
             }
+            if replaced.len() > MAX_REPLACEMENTS {
+                return Err(Reject::new(-26, "too many potential replacements"));
+            }
             let replaced_fees: u64 = replaced.iter().map(|t| self.txs[t].fee).sum();
             if fee < replaced_fees + INCREMENTAL_FEERATE * vsize / 1000 {
                 return Err(Reject::new(-26, "insufficient fee"));
             }
-            if conflicts.iter().any(|t| self.txs[t].feerate() >= fee * 1000 / vsize) {
+            if conflicts.iter().any(|t| self.txs[t].feerate() >= feerate) {
                 return Err(Reject::new(-26, "insufficient fee"));
             }
         }
+        self.check_chain_limits(&parents, &replaced)?;
 
         let check = TxCheck { raw: &raw, spent: prevouts.iter().map(|p| (p.script.clone(), p.value)).collect() };
         if let Err((_, reason)) = verify_scripts(&[check], flags) {
             return Err(Reject::invalid(&format!("mandatory-script-verify-flag-failed ({reason})")));
         }
 
-        for txid in &replaced {
-            self.remove(txid);
-        }
         let outputs = tx.outputs.iter().map(|o| (o.value, o.script.to_vec())).collect();
         let weight = tx.weight() as u64;
         drop(tx);
-        self.seq += 1;
-        let entry = Entry {
-            txid,
-            raw,
-            fee,
-            vsize,
-            weight,
-            time,
-            prevouts,
-            outputs,
-            parents,
-            children: HashSet::new(),
-            seq: self.seq,
-        };
-        self.insert(entry);
-        self.trim();
-        if !self.txs.contains_key(&txid) {
-            return Err(Reject::new(-26, "mempool full"));
+        let entry =
+            Entry { txid, raw, fee, vsize, weight, time, prevouts, outputs, parents, children: HashSet::new(), seq: 0 };
+        Ok(Checked { entry, replaced, generation: self.generation })
+    }
+
+    /// Whether a transaction spending `parents` would have too many
+    /// ancestors, or give one of them too many descendants, once what it
+    /// replaces is gone.
+    fn check_chain_limits(&self, parents: &HashSet<Hash>, replaced: &HashSet<Hash>) -> Result<(), Reject> {
+        let ancestors = self.ancestors(parents);
+        if ancestors.len() + 1 > MAX_ANCESTORS {
+            return Err(Reject::new(-26, "too-long-mempool-chain"));
         }
-        Ok(txid)
+        for ancestor in &ancestors {
+            let descendants = self.with_descendants(&HashSet::from([*ancestor]));
+            if descendants.difference(replaced).count() + 1 > MAX_DESCENDANTS {
+                return Err(Reject::new(-26, "too-long-mempool-chain"));
+            }
+        }
+        Ok(())
+    }
+
+    /// `parents` and every transaction here they spend, and those spend.
+    fn ancestors(&self, parents: &HashSet<Hash>) -> HashSet<Hash> {
+        let mut all = HashSet::new();
+        let mut todo: Vec<Hash> = parents.iter().copied().collect();
+        while let Some(txid) = todo.pop() {
+            if all.insert(txid)
+                && let Some(entry) = self.txs.get(&txid)
+            {
+                todo.extend(entry.parents.iter().copied());
+            }
+        }
+        all
+    }
+
+    /// Adds a transaction [`Mempool::check`] passed, removing what it
+    /// replaces and, if there's no room, what pays least, which mustn't
+    /// be it or anything it needs. Returns its txid, or `None` if the
+    /// mempool's changed since it was checked, and it must be again.
+    pub fn add(&mut self, checked: Checked) -> Option<Result<Hash, Reject>> {
+        if checked.generation != self.generation {
+            return None;
+        }
+        let Checked { mut entry, replaced, .. } = checked;
+        let txid = entry.txid;
+        let feerate = entry.feerate();
+
+        // What would be evicted to make room, without removing anything yet.
+        let freed: usize = replaced.iter().map(|t| self.txs[t].footprint()).sum();
+        let over = (self.bytes + entry.footprint()).saturating_sub(freed + MAX_BYTES);
+        let mut evict: HashSet<Hash> = HashSet::new();
+        let mut evicted_rate = 0;
+        if over > 0 {
+            let ancestors = self.ancestors(&entry.parents);
+            let mut evicting = 0;
+            for &(rate, candidate) in &self.by_rate {
+                if evicting >= over {
+                    break;
+                }
+                if replaced.contains(&candidate) || evict.contains(&candidate) {
+                    continue;
+                }
+                if rate >= feerate {
+                    return Some(Err(Reject::new(-26, "mempool full")));
+                }
+                let set = self.with_descendants(&HashSet::from([candidate]));
+                if set.iter().any(|t| ancestors.contains(t)) {
+                    return Some(Err(Reject::new(-26, "mempool full")));
+                }
+                for t in set {
+                    if !replaced.contains(&t) && evict.insert(t) {
+                        evicting += self.txs[&t].footprint();
+                    }
+                }
+                evicted_rate = rate;
+            }
+        }
+
+        for txid in &replaced {
+            self.remove(txid);
+        }
+        for txid in &evict {
+            self.remove(txid);
+        }
+        if !evict.is_empty() {
+            // Nothing paying less than what was evicted is taken for a while.
+            let rate = (evicted_rate + INCREMENTAL_FEERATE) as f64;
+            let current = self.min_feerate(now()) as f64;
+            self.min_feerate = (rate.max(current), now());
+            tracing::debug!("mempool full: evicted {} transactions", evict.len());
+        }
+        self.seq += 1;
+        entry.seq = self.seq;
+        self.insert(entry);
+        Some(Ok(txid))
+    }
+
+    fn note_change(&mut self, keys: impl Iterator<Item = [u8; 8]>) {
+        self.generation += 1;
+        let generation = self.generation;
+        self.changes.extend(keys.map(|key| (generation, key)));
+        while self.changes.len() > MAX_CHANGES {
+            let (g, _) = self.changes.pop_front().unwrap();
+            self.changes_from = self.changes_from.max(g);
+        }
     }
 
     fn insert(&mut self, entry: Entry) {
@@ -361,15 +554,25 @@ impl Mempool {
                 parent.children.insert(txid);
             }
         }
-        self.bytes += entry.raw.len();
+        let keys: Vec<[u8; 8]> = entry
+            .prevouts
+            .iter()
+            .map(|p| script_key(&p.script))
+            .chain(entry.outputs.iter().map(|(_, s)| script_key(s)))
+            .collect();
+        self.note_change(keys.into_iter());
+        self.bytes += entry.footprint();
         self.vsize += entry.vsize;
         self.fees += entry.fee;
+        self.by_rate.insert((entry.feerate(), txid));
+        self.by_seq.insert(entry.seq, txid);
         self.txs.insert(txid, entry);
     }
 
     /// Removes one transaction, leaving those spending it.
     fn remove(&mut self, txid: &Hash) -> Option<Entry> {
         let entry = self.txs.remove(txid)?;
+        self.bytes -= entry.footprint();
         for p in &entry.prevouts {
             if self.spends.get(&(p.txid, p.vout)) == Some(txid) {
                 self.spends.remove(&(p.txid, p.vout));
@@ -384,17 +587,28 @@ impl Mempool {
                 parent.children.remove(txid);
             }
         }
+        let mut keys: Vec<[u8; 8]> = entry
+            .prevouts
+            .iter()
+            .map(|p| script_key(&p.script))
+            .chain(entry.outputs.iter().map(|(_, s)| script_key(s)))
+            .collect();
         for child in &entry.children {
             if let Some(child) = self.txs.get_mut(child) {
                 child.parents.remove(txid);
                 for p in child.prevouts.iter_mut().filter(|p| p.txid == *txid) {
                     p.unconfirmed = false;
                 }
+                // Whether it spends unconfirmed outputs is in its scripts' statuses.
+                keys.extend(child.prevouts.iter().map(|p| script_key(&p.script)));
+                keys.extend(child.outputs.iter().map(|(_, s)| script_key(s)));
             }
         }
-        self.bytes -= entry.raw.len();
+        self.note_change(keys.into_iter());
         self.vsize -= entry.vsize;
         self.fees -= entry.fee;
+        self.by_rate.remove(&(entry.feerate(), *txid));
+        self.by_seq.remove(&entry.seq);
         Some(entry)
     }
 
@@ -418,16 +632,10 @@ impl Mempool {
         }
     }
 
-    /// Evicts the transactions paying the lowest rate, with whatever spends
-    /// them, while there are too many bytes of them.
-    fn trim(&mut self) {
-        if self.bytes <= MAX_BYTES {
-            return;
-        }
-        let mut by_rate: Vec<(u64, Hash)> = self.txs.values().map(|e| (e.feerate(), e.txid)).collect();
-        by_rate.sort_unstable();
-        for (_, txid) in by_rate {
-            if self.bytes <= MAX_BYTES {
+    /// Removes what's been here longer than it may.
+    fn expire(&mut self, now: u64) {
+        while let Some((_, txid)) = self.by_seq.first_key_value().map(|(s, t)| (*s, *t)) {
+            if self.txs[&txid].time + EXPIRY > now {
                 break;
             }
             self.remove_with_descendants(&txid);
@@ -435,31 +643,45 @@ impl Mempool {
     }
 
     /// Catches up with the blocks `store` has committed since the last
-    /// time: what they confirm, or conflict with, leaves.
-    pub fn sync(&mut self, store: &Store) {
+    /// time: what they confirm, or conflict with, leaves. If the chain's
+    /// reorganized, empties the mempool and returns what was in it, in the
+    /// order it arrived, with when, to be checked again.
+    pub fn sync(&mut self, store: &Store) -> Option<Vec<(u64, Vec<u8>)>> {
+        self.expire(now());
         let snapshot = store.snapshot();
-        let Some((tip, record)) = store.tip() else { return };
+        let (tip, record) = store.tip()?;
         let tip_hash = record.hash();
         if self.synced == Some((tip, tip_hash)) {
-            return;
+            return None;
         }
         let from = match self.synced {
             Some((height, hash)) if height <= tip && store.block(height).is_some_and(|b| b.hash() == hash) => {
                 height + 1
             }
             Some(_) => {
-                self.synced = Some((tip, tip_hash));
-                self.recheck(store);
-                return;
+                let mut entries: Vec<Entry> = std::mem::take(&mut self.txs).into_values().collect();
+                entries.sort_unstable_by_key(|e| e.seq);
+                let generation = self.generation + 1;
+                *self = Mempool {
+                    synced: Some((tip, tip_hash)),
+                    seq: self.seq,
+                    generation,
+                    changes_from: generation,
+                    min_feerate: self.min_feerate,
+                    stats: std::mem::take(&mut self.stats),
+                    ..Mempool::default()
+                };
+                return Some(entries.into_iter().map(|e| (e.time, e.raw)).collect());
             }
             None => tip + 1,
         };
         self.synced = Some((tip, tip_hash));
         if self.txs.is_empty() {
-            return;
+            return None;
         }
         for height in from..=tip {
-            let first = store.block(height).unwrap().first_tx;
+            let Some(block) = store.block(height) else { break };
+            let first = block.first_tx;
             for txnum in first..first + store.tx_count(height, &snapshot) {
                 let txid = store.txid(txnum);
                 self.remove(&txid);
@@ -475,24 +697,7 @@ impl Mempool {
                 }
             }
         }
-    }
-
-    /// Checks every transaction again, as after a reorg, in the order they
-    /// arrived, so parents come before children.
-    fn recheck(&mut self, store: &Store) {
-        let mut entries: Vec<Entry> = std::mem::take(&mut self.txs).into_values().collect();
-        entries.sort_unstable_by_key(|e| e.seq);
-        let synced = self.synced;
-        let stats = std::mem::take(&mut self.stats);
-        *self = Mempool { synced, seq: self.seq, stats, ..Mempool::default() };
-        let count = entries.len();
-        let mut kept = 0;
-        for entry in entries {
-            if self.check_and_insert(store, entry.raw, entry.time).is_ok() {
-                kept += 1;
-            }
-        }
-        tracing::info!("the chain changed: kept {kept} of {count} unconfirmed transactions");
+        None
     }
 
     /// The transactions this spends that are neither here nor in a block:
@@ -513,12 +718,11 @@ impl Mempool {
     /// Writes every transaction, in the order they arrived, to `path`.
     pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
         use std::io::Write;
-        let mut entries: Vec<&Entry> = self.txs.values().collect();
-        entries.sort_unstable_by_key(|e| e.seq);
         let tmp = path.with_extension("dat.new");
         let mut out = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
         out.write_all(SAVED_MAGIC)?;
-        for entry in entries {
+        for txid in self.by_seq.values() {
+            let entry = &self.txs[txid];
             out.write_all(&entry.time.to_le_bytes())?;
             out.write_all(&(entry.raw.len() as u32).to_le_bytes())?;
             out.write_all(&entry.raw)?;
@@ -527,37 +731,26 @@ impl Mempool {
         std::fs::rename(tmp, path)
     }
 
-    /// The fee rate, in sat/vB, a transaction needs to be in about `target`
-    /// blocks, from how the transactions here would fill blocks, highest
-    /// rate first; at least `floor`.
-    pub fn fee_estimates(&self, targets: &[u32], floor: f64) -> Vec<(u32, f64)> {
+    /// Figures the summary afresh, if anything's changed.
+    fn summarize(&self) -> Option<Summary> {
+        if self.summary_generation == self.generation {
+            return None;
+        }
         const BLOCK_VSIZE: u64 = 1_000_000 - 4_000;
-        let mut by_rate: Vec<(u64, u64)> = self.txs.values().map(|e| (e.feerate(), e.vsize)).collect();
-        by_rate.sort_unstable_by_key(|r| std::cmp::Reverse(r.0));
-        // The lowest rate in each block, filled in turn.
         let mut lowest = Vec::new();
         let mut filled = 0;
-        for (rate, vsize) in by_rate {
+        for &(rate, txid) in self.by_rate.iter().rev() {
+            let vsize = self.txs[&txid].vsize;
             if filled + vsize > BLOCK_VSIZE {
                 lowest.push(rate);
                 filled = 0;
             }
             filled += vsize;
         }
-        targets
-            .iter()
-            .map(|&target| {
-                let rate = lowest.get(target as usize - 1).map_or(floor, |&r| (r as f64 / 1000.0).max(floor));
-                (target, (rate * 1000.0).round() / 1000.0)
-            })
-            .collect()
-    }
 
-    /// How many virtual bytes of transactions pay each range of fee rates,
-    /// highest first, as electrs makes Electrum's `mempool.get_fee_histogram`
-    /// and Esplora's `fee_histogram`: each entry is the lowest rate in its
-    /// bin, in sat/vB, and the vsize of the bin, about 50,000 vbytes.
-    pub fn fee_histogram(&self) -> Vec<(f64, u64)> {
+        // As electrs makes Electrum's `mempool.get_fee_histogram` and
+        // Esplora's `fee_histogram`: each entry is the lowest rate in its
+        // bin, in sat/vB, and the vsize of the bin, about 50,000 vbytes.
         const BIN: u64 = 50_000;
         let mut by_rate: Vec<(f64, u64)> =
             self.txs.values().map(|e| (e.fee as f64 / e.vsize.max(1) as f64, e.vsize)).collect();
@@ -576,7 +769,38 @@ impl Mempool {
         if bin > 0 {
             histogram.push((last_rate, bin));
         }
-        histogram
+
+        let recent = self
+            .by_seq
+            .values()
+            .rev()
+            .take(10)
+            .map(|txid| {
+                let e = &self.txs[txid];
+                Recent { txid: e.txid, fee: e.fee, vsize: e.vsize, value: e.outputs.iter().map(|(v, _)| v).sum() }
+            })
+            .collect();
+        Some(Summary { lowest, histogram, recent })
+    }
+
+    /// The fee rate, in sat/vB, a transaction needs to be in about `target`
+    /// blocks, from how the transactions here would fill blocks, highest
+    /// rate first; at least `floor`. As of the last summary.
+    pub fn fee_estimates(&self, targets: &[u32], floor: f64) -> Vec<(u32, f64)> {
+        targets
+            .iter()
+            .map(|&target| {
+                let lowest = target.checked_sub(1).and_then(|i| self.summary.lowest.get(i as usize));
+                let rate = lowest.map_or(floor, |&r| (r as f64 / 1000.0).max(floor));
+                (target, (rate * 1000.0).round() / 1000.0)
+            })
+            .collect()
+    }
+
+    /// How many virtual bytes of transactions pay each range of fee rates,
+    /// highest first, as of the last summary.
+    pub fn fee_histogram(&self) -> Vec<(f64, u64)> {
+        self.summary.histogram.clone()
     }
 }
 
@@ -589,8 +813,7 @@ fn unlink(map: &mut HashMap<[u8; 8], HashSet<Hash>>, key: &[u8; 8], txid: &Hash)
     }
 }
 
-/// The checks of a transaction on its own, as Core's `CheckTransaction`,
-/// and the standardness rules that matter.
+/// The checks of a transaction on its own, as Core's `CheckTransaction`.
 fn check_tx(tx: &Tx<'_>) -> Result<(), Reject> {
     if tx.is_coinbase() {
         return Err(Reject::invalid("coinbase"));
@@ -626,9 +849,102 @@ fn check_tx(tx: &Tx<'_>) -> Result<(), Reject> {
     Ok(())
 }
 
+/// Whether an output script is one Core relays: a standard template, a
+/// witness program, or data after `OP_RETURN`.
+fn is_standard_output(script: &[u8]) -> bool {
+    let s = bitcoin::Script::from_bytes(script);
+    if s.is_op_return() || s.is_p2pk() || s.is_p2pkh() || s.is_p2sh() || s.witness_version().is_some() {
+        return true;
+    }
+    // Bare multisig, of at most three keys.
+    if s.is_multisig() {
+        let n = script[script.len() - 2];
+        return (0x51..=0x53).contains(&n);
+    }
+    false
+}
+
+/// The least an output may pay not to be dust, as Core's `GetDustThreshold`.
+fn dust_threshold(script: &[u8]) -> u64 {
+    let s = bitcoin::Script::from_bytes(script);
+    if s.is_op_return() {
+        return 0;
+    }
+    let size = 8 + crate::block::compact_size_len(script.len() as u64) + script.len();
+    let spend = if s.witness_version().is_some() { 32 + 4 + 1 + 107 / 4 + 4 } else { 32 + 4 + 1 + 107 + 4 };
+    (size + spend) as u64 * DUST_RELAY_FEERATE / 1000
+}
+
+/// Core's `IsStandardTx`, as far as it goes without the outputs spent.
+fn check_standard(tx: &Tx<'_>) -> Result<(), Reject> {
+    if !(1..=3).contains(&tx.version) {
+        return Err(Reject::invalid("version"));
+    }
+    for input in &tx.inputs {
+        if input.script_sig.len() > MAX_STANDARD_SCRIPTSIG_SIZE {
+            return Err(Reject::invalid("scriptsig-size"));
+        }
+        if !bitcoin::Script::from_bytes(input.script_sig).is_push_only() {
+            return Err(Reject::invalid("scriptsig-not-pushonly"));
+        }
+    }
+    for out in &tx.outputs {
+        if !is_standard_output(out.script) {
+            return Err(Reject::invalid("scriptpubkey"));
+        }
+        if out.value < dust_threshold(out.script) {
+            return Err(Reject::invalid("dust"));
+        }
+    }
+    Ok(())
+}
+
+/// Core's `AreInputsStandard` and `IsWitnessStandard`, much as they go:
+/// the outputs spent are standard, P2SH redeem scripts have few sigops,
+/// P2WSH spends are within its limits, and no taproot spend has an annex.
+fn check_inputs_standard(tx: &Tx<'_>, prevouts: &[Prevout]) -> Result<(), Reject> {
+    for (input, prevout) in tx.inputs.iter().zip(prevouts) {
+        let prev = bitcoin::Script::from_bytes(&prevout.script);
+        if !is_standard_output(&prevout.script) || prev.is_op_return() {
+            return Err(Reject::invalid("bad-txns-nonstandard-inputs"));
+        }
+        let witness = crate::compact::witness_items(input.witness);
+        let mut program = prev.to_owned();
+        if prev.is_p2sh() {
+            let Some(redeem) = crate::script::last_push(input.script_sig) else {
+                return Err(Reject::invalid("bad-txns-nonstandard-inputs"));
+            };
+            if bitcoin::Script::from_bytes(&redeem).count_sigops() > MAX_P2SH_SIGOPS {
+                return Err(Reject::invalid("bad-txns-nonstandard-inputs"));
+            }
+            program = bitcoin::ScriptBuf::from_bytes(redeem);
+        }
+        if program.is_p2wsh() {
+            let Some((script, stack)) = witness.split_last() else { continue };
+            if script.len() > MAX_STANDARD_P2WSH_SCRIPT_SIZE
+                || stack.len() > MAX_STANDARD_P2WSH_STACK_ITEMS
+                || stack.iter().any(|item| item.len() > MAX_STANDARD_P2WSH_STACK_ITEM_SIZE)
+            {
+                return Err(Reject::invalid("bad-witness-nonstandard"));
+            }
+        } else if program.is_p2tr() && !prev.is_p2sh() {
+            if witness.len() >= 2 && witness.last().is_some_and(|annex| annex.first() == Some(&0x50)) {
+                return Err(Reject::invalid("bad-witness-nonstandard"));
+            }
+        } else if program.witness_version().is_some_and(|v| v.to_num() > 1) && !witness.is_empty() {
+            // Spending a witness version yet to be defined.
+            return Err(Reject::invalid("bad-witness-nonstandard"));
+        }
+    }
+    Ok(())
+}
+
 /// The mempool shared between the node, the API and the thread checking
 /// transactions.
-pub type Shared = std::sync::Arc<std::sync::RwLock<Mempool>>;
+pub type Shared = Arc<std::sync::RwLock<Mempool>>;
+
+/// Where to send transactions to be checked.
+pub type Submit = std::sync::mpsc::SyncSender<(Vec<u8>, Source)>;
 
 /// Where a transaction to check came from.
 pub enum Source {
@@ -636,6 +952,59 @@ pub enum Source {
     Peer(Option<PeerId>),
     /// Sent to the API, which is told how it went.
     Api(tokio::sync::oneshot::Sender<Result<Hash, Reject>>),
+}
+
+/// Sends a transaction sent to the API to be checked, and waits to hear
+/// how it went.
+pub async fn submit(submit: &Submit, raw: Vec<u8>) -> Result<Hash, Reject> {
+    let (reply_tx, reply) = tokio::sync::oneshot::channel();
+    match submit.try_send((raw, Source::Api(reply_tx))) {
+        Ok(()) => {}
+        Err(std::sync::mpsc::TrySendError::Full(_)) => return Err(Reject::new(-28, "too busy, try again")),
+        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => return Err(Reject::new(-28, "shutting down")),
+    }
+    reply.await.unwrap_or_else(|_| Err(Reject::new(-28, "shutting down")))
+}
+
+/// Takes the write lock once it's free, without waiting in line for it,
+/// which would keep readers waiting behind.
+fn write(shared: &Shared) -> std::sync::RwLockWriteGuard<'_, Mempool> {
+    loop {
+        match shared.try_write() {
+            Ok(guard) => return guard,
+            Err(std::sync::TryLockError::WouldBlock) => std::thread::sleep(Duration::from_millis(1)),
+            Err(std::sync::TryLockError::Poisoned(err)) => panic!("the mempool's lock is poisoned: {err}"),
+        }
+    }
+}
+
+/// Checks and adds a transaction that arrived at `time`, counting how it
+/// went.
+fn accept(shared: &Shared, store: &Store, raw: Vec<u8>, time: u64) -> Result<Hash, Reject> {
+    let result = loop {
+        let checked = shared.read().unwrap().check(store, raw.clone(), time);
+        match checked {
+            Ok(checked) => {
+                if let Some(result) = write(shared).add(checked) {
+                    break result;
+                }
+            }
+            Err(reject) => break Err(reject),
+        }
+    };
+    count(shared, &result);
+    result
+}
+
+fn count(shared: &Shared, result: &Result<Hash, Reject>) {
+    let mut mempool = write(shared);
+    match result {
+        Ok(_) => mempool.stats.accepted += 1,
+        Err(reject) => {
+            let reason = reject.reason.split(" (").next().unwrap_or_default().to_string();
+            *mempool.stats.refused.entry(reason).or_default() += 1;
+        }
+    }
 }
 
 /// Transactions to ask peers for: of the one given, or of any.
@@ -751,10 +1120,13 @@ impl Orphans {
 /// The thread checking transactions, and what it keeps.
 struct Checker {
     mempool: Shared,
-    store: std::sync::Arc<Store>,
-    relay: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    store: Arc<Store>,
+    relay: tokio::sync::mpsc::Sender<Vec<u8>>,
     wants: tokio::sync::mpsc::UnboundedSender<Want>,
     orphans: Orphans,
+    /// Transactions refused, by wtxid, until the chain moves on.
+    refused: HashSet<Hash>,
+    refused_at: Option<Hash>,
 }
 
 impl Checker {
@@ -762,12 +1134,29 @@ impl Checker {
     fn submit(&mut self, raw: Vec<u8>, source: Source, time: u64) {
         let mut queue = vec![(raw, source, time)];
         while let Some((raw, source, time)) = queue.pop() {
-            let mut mempool = self.mempool.write().unwrap();
-            let result = mempool.accept_at(&self.store, raw.clone(), time);
+            let tip = self.store.tip().map(|(_, record)| record.hash());
+            if self.refused_at != tip || self.refused.len() >= MAX_REFUSED {
+                self.refused.clear();
+                self.refused_at = tip;
+            }
+            let wtxid = crate::hash::sha256d(&raw);
+            let result = if self.refused.contains(&wtxid) {
+                let result = Err(Reject::new(-26, "refused already"));
+                count(&self.mempool, &result);
+                result
+            } else {
+                let result = accept(&self.mempool, &self.store, raw.clone(), time);
+                if let Err(reject) = &result
+                    && !reject.may_pass_later()
+                {
+                    self.refused.insert(wtxid);
+                }
+                result
+            };
             let from = match source {
                 Source::Api(reply) => {
                     if result.is_ok() {
-                        let _ = self.relay.send(raw.clone());
+                        let _ = self.relay.try_send(raw.clone());
                     }
                     let _ = reply.send(result.clone());
                     None
@@ -781,16 +1170,40 @@ impl Checker {
                     }
                 }
                 Err(reject) if reject.code == -25 => {
-                    let parents = mempool.missing_parents(&self.store, &raw);
+                    let parents = self.mempool.read().unwrap().missing_parents(&self.store, &raw);
                     let Ok(tx) = parse_tx(&raw) else { continue };
                     if !parents.is_empty() && self.orphans.add(tx.txid, raw.clone(), from, parents.clone()) {
-                        mempool.stats.orphaned += 1;
+                        write(&self.mempool).stats.orphaned += 1;
                         let _ = self.wants.send((from, parents));
                     }
                 }
                 Err(reject) => tracing::trace!("refused a transaction: {reject}"),
             }
-            mempool.stats.orphans = self.orphans.len();
+            write(&self.mempool).stats.orphans = self.orphans.len();
+        }
+    }
+
+    /// Catches up with the store, checking everything again after a reorg.
+    fn sync(&mut self) {
+        let Some(txs) = write(&self.mempool).sync(&self.store) else { return };
+        let count = txs.len();
+        let kept = txs
+            .into_iter()
+            .filter(|(time, raw)| accept(&self.mempool, &self.store, raw.clone(), *time).is_ok())
+            .count();
+        tracing::info!("the chain changed: kept {kept} of {count} unconfirmed transactions");
+    }
+
+    /// Figures the summary again, if the mempool's changed.
+    fn summarize(&self) {
+        let summary = {
+            let mempool = self.mempool.read().unwrap();
+            mempool.summarize().map(|s| (s, mempool.generation))
+        };
+        if let Some((summary, generation)) = summary {
+            let mut mempool = write(&self.mempool);
+            mempool.summary = Arc::new(summary);
+            mempool.summary_generation = generation;
         }
     }
 }
@@ -803,18 +1216,27 @@ impl Checker {
 /// and saved to it every ten minutes.
 pub fn spawn(
     mempool: Shared,
-    store: std::sync::Arc<Store>,
-    relay: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    store: Arc<Store>,
+    relay: tokio::sync::mpsc::Sender<Vec<u8>>,
     wants: tokio::sync::mpsc::UnboundedSender<Want>,
     saved: Option<PathBuf>,
-) -> std::sync::mpsc::Sender<(Vec<u8>, Source)> {
-    let (tx, rx) = std::sync::mpsc::channel::<(Vec<u8>, Source)>();
-    let mut checker = Checker { mempool, store, relay, wants, orphans: Orphans::default() };
+) -> Submit {
+    let (tx, rx) = std::sync::mpsc::sync_channel::<(Vec<u8>, Source)>(QUEUE);
+    let mut checker = Checker {
+        mempool,
+        store,
+        relay,
+        wants,
+        orphans: Orphans::default(),
+        refused: HashSet::new(),
+        refused_at: None,
+    };
     std::thread::Builder::new()
         .name("mempool".into())
         .spawn(move || {
             let mut to_load = saved.clone().filter(|path| path.exists());
             let mut last_save = Instant::now();
+            let mut last_summary = Instant::now();
             let mut tip = None;
             loop {
                 match rx.recv_timeout(Duration::from_secs(1)) {
@@ -826,6 +1248,7 @@ pub fn spawn(
                             }
                             continue;
                         }
+                        checker.sync();
                         checker.submit(raw, source, now());
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
@@ -847,7 +1270,7 @@ pub fn spawn(
                         Err(err) => tracing::warn!("couldn't load {}: {err}", path.display()),
                     }
                 }
-                checker.mempool.write().unwrap().sync(&checker.store);
+                checker.sync();
                 // A new block may hold an orphan's parents.
                 let now_tip = checker.store.tip().map(|(height, record)| (height, record.hash()));
                 if now_tip != tip {
@@ -857,6 +1280,10 @@ pub fn spawn(
                     }
                 }
                 checker.orphans.expire();
+                if last_summary.elapsed() >= Duration::from_secs(1) {
+                    last_summary = Instant::now();
+                    checker.summarize();
+                }
                 if let Some(path) = &saved
                     && last_save.elapsed() >= SAVE_EVERY
                 {
@@ -925,6 +1352,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn standard_outputs_and_dust() {
+        let p2pkh = hex::decode("76a914000000000000000000000000000000000000000088ac").unwrap();
+        let p2wpkh = hex::decode("00140000000000000000000000000000000000000000").unwrap();
+        assert_eq!(dust_threshold(&p2pkh), 546);
+        assert_eq!(dust_threshold(&p2wpkh), 294);
+        assert_eq!(dust_threshold(&[0x6a, 0x01, 0x00]), 0);
+        assert!(is_standard_output(&p2pkh));
+        assert!(is_standard_output(&p2wpkh));
+        assert!(is_standard_output(&[0x51, 0x02, 0x4e, 0x73]));
+        assert!(is_standard_output(&[0x6a]));
+        assert!(!is_standard_output(&[0x51]));
+        assert!(!is_standard_output(&[]));
+    }
+
+    #[test]
     fn orphans_wait_for_their_parents() {
         let mut orphans = Orphans::default();
         let (a, b, c) = ([1; 32], [2; 32], [3; 32]);
@@ -974,6 +1416,7 @@ mod tests {
                     seq: mempool.seq,
                 },
             );
+            mempool.by_seq.insert(mempool.seq, txid);
         }
         mempool.save(&path).unwrap();
         assert_eq!(load(&path).unwrap(), vec![(1000, vec![1, 2, 3]), (1001, vec![4; 300])]);

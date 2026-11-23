@@ -25,7 +25,7 @@ use serde_json::{Value, json};
 use super::esplora::{Ctx, FEE_FLOOR, Found, History, ScriptRef, mempool_activity};
 use super::{AppState, blocking};
 use crate::hash::{Hash, to_hex_rev};
-use crate::mempool::{Entry, Source};
+use crate::mempool::Entry;
 use crate::script;
 
 /// Unused addresses in a row that end a scan of a chain.
@@ -635,12 +635,9 @@ fn estimates(state: &AppState, targets: &[u32]) -> Vec<u64> {
 
 async fn send_tx(state: &AppState, hex_tx: &str) -> Result<String, String> {
     let raw = hex::decode(hex_tx.trim()).map_err(|_| "Invalid hex".to_string())?;
-    let (reply_tx, reply) = tokio::sync::oneshot::channel();
-    state.mempool_tx.send((raw, Source::Api(reply_tx))).map_err(|_| "shutting down".to_string())?;
-    match reply.await {
-        Ok(Ok(txid)) => Ok(to_hex_rev(&txid)),
-        Ok(Err(reject)) => Err(format!("-{}: {}", reject.code.unsigned_abs(), reject.reason)),
-        Err(_) => Err("shutting down".into()),
+    match crate::mempool::submit(&state.mempool_tx, raw).await {
+        Ok(txid) => Ok(to_hex_rev(&txid)),
+        Err(reject) => Err(format!("-{}: {}", reject.code.unsigned_abs(), reject.reason)),
     }
 }
 

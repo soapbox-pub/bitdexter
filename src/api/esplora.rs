@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 use super::{ApiError, AppState, blocking};
 use crate::compact::CompactTx;
 use crate::hash::{Hash, from_hex_rev, merkle_branch, to_hex_rev};
-use crate::mempool::{Entry, Mempool, Source};
+use crate::mempool::{Entry, Mempool};
 use crate::script;
 use crate::store::{Snapshot, Store};
 
@@ -892,18 +892,13 @@ async fn address_utxo(
 /// Errors are given as electrs gives bitcoind's.
 async fn broadcast(State(state): State<AppState>, body: String) -> Result<Response, ApiError> {
     let raw = hex::decode(body.trim()).map_err(|_| ApiError::bad_request("Invalid hex string"))?;
-    let (reply_tx, reply) = tokio::sync::oneshot::channel();
-    state
-        .mempool_tx
-        .send((raw, Source::Api(reply_tx)))
-        .map_err(|_| ApiError(StatusCode::SERVICE_UNAVAILABLE, "shutting down".into()))?;
-    match reply.await {
-        Ok(Ok(txid)) => Ok(text(to_hex_rev(&txid))),
-        Ok(Err(reject)) => {
+    match crate::mempool::submit(&state.mempool_tx, raw).await {
+        Ok(txid) => Ok(text(to_hex_rev(&txid))),
+        Err(reject) if reject.code == -28 => Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, reject.reason)),
+        Err(reject) => {
             let error = json!({ "code": reject.code, "message": reject.reason });
             Err(ApiError::bad_request(&format!("sendrawtransaction RPC error: {error}")))
         }
-        Err(_) => Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, "shutting down".into())),
     }
 }
 
@@ -918,22 +913,26 @@ async fn mempool_info(State(state): State<AppState>) -> Json<Value> {
     }))
 }
 
-async fn mempool_txids(State(state): State<AppState>) -> Json<Vec<String>> {
-    Json(state.mempool.read().unwrap().entries().map(|e| to_hex_rev(&e.txid)).collect())
+async fn mempool_txids(State(state): State<AppState>) -> Result<Response, ApiError> {
+    blocking(move || {
+        let txids: Vec<String> = state.mempool.read().unwrap().entries().map(|e| to_hex_rev(&e.txid)).collect();
+        Ok(Json(txids).into_response())
+    })
+    .await
 }
 
 async fn mempool_recent(State(state): State<AppState>) -> Json<Vec<Value>> {
     let mempool = state.mempool.read().unwrap();
     Json(
         mempool
-            .recent(10)
+            .recent()
             .into_iter()
             .map(|e| {
                 json!({
                     "txid": to_hex_rev(&e.txid),
                     "fee": e.fee,
                     "vsize": e.vsize,
-                    "value": e.outputs.iter().map(|(v, _)| v).sum::<u64>(),
+                    "value": e.value,
                 })
             })
             .collect(),

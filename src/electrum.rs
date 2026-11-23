@@ -22,7 +22,7 @@ use tokio::net::{TcpListener, TcpStream};
 
 use crate::api::{Ctx, History, ScriptRef, mempool_activity};
 use crate::hash::{Hash, from_hex_rev, merkle_branch, sha256, to_hex_rev};
-use crate::mempool::{self, Source};
+use crate::mempool;
 use crate::store::Store;
 
 const PROTOCOL: &str = "1.4";
@@ -35,7 +35,7 @@ const MAX_LINE: usize = 1 << 20;
 pub struct Server {
     pub store: Arc<Store>,
     pub mempool: mempool::Shared,
-    pub mempool_tx: std::sync::mpsc::Sender<(Vec<u8>, Source)>,
+    pub mempool_tx: mempool::Submit,
 }
 
 struct RpcError(i32, String);
@@ -299,12 +299,9 @@ impl Server {
 
     async fn broadcast(&self, params: &Value) -> Result<Value, RpcError> {
         let raw = hex::decode(param_str(params, 0)?).map_err(|_| bad("invalid hex"))?;
-        let (reply_tx, reply) = tokio::sync::oneshot::channel();
-        self.mempool_tx.send((raw, Source::Api(reply_tx))).map_err(|_| bad("shutting down"))?;
-        match reply.await {
-            Ok(Ok(txid)) => Ok(json!(to_hex_rev(&txid))),
-            Ok(Err(reject)) => Err(bad(reject.reason)),
-            Err(_) => Err(bad("shutting down")),
+        match mempool::submit(&self.mempool_tx, raw).await {
+            Ok(txid) => Ok(json!(to_hex_rev(&txid))),
+            Err(reject) => Err(bad(reject.reason)),
         }
     }
 

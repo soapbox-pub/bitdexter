@@ -24,7 +24,7 @@ pub struct AppState {
     pub status: Arc<Mutex<Status>>,
     pub mempool: crate::mempool::Shared,
     /// Where transactions sent to the API go to be checked.
-    pub mempool_tx: std::sync::mpsc::Sender<(Vec<u8>, crate::mempool::Source)>,
+    pub mempool_tx: crate::mempool::Submit,
     pub prices: crate::prices::Shared,
 }
 
