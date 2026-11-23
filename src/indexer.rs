@@ -82,14 +82,16 @@ pub fn spawn(
         .name("indexer".into())
         .spawn(move || {
             let mut progress = Progress { since: Instant::now(), blocks: 0, txs: 0, bytes: 0 };
-            let mut target = 0u32;
+            // Unknown until the node sends a block: until then, indexing in
+            // bulk mustn't be taken for caught up.
+            let mut target: Option<u32> = None;
             loop {
                 let command = match commands.try_recv() {
                     Ok(command) => command,
                     Err(mpsc::error::TryRecvError::Empty) => {
                         let tip = writer.next_height().saturating_sub(1);
                         if writer.in_bulk()
-                            && target.saturating_sub(tip) <= CAUGHT_UP
+                            && target.is_some_and(|target| target.saturating_sub(tip) <= CAUGHT_UP)
                             && let Err(err) = writer.finish_bulk()
                         {
                             let _ = events.send(Event::Failed(format!("merging: {err:#}")));
@@ -108,13 +110,13 @@ pub fn spawn(
                 };
                 match command {
                     Command::Connect { height, hash, bytes, target: to, verify } => {
-                        target = to;
+                        target = Some(to);
                         if height != writer.next_height() {
                             // Sent before a block it builds on was rejected.
                             continue;
                         }
                         if !writer.in_bulk()
-                            && target.saturating_sub(height) > bulk_threshold
+                            && to.saturating_sub(height) > bulk_threshold
                             && let Err(err) = writer.begin_bulk()
                         {
                             let _ = events.send(Event::Failed(format!("starting bulk indexing: {err:#}")));
