@@ -9,6 +9,7 @@ pub(crate) use esplora::{Ctx, Found, History, ScriptRef, mempool_activity};
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -59,9 +60,17 @@ impl IntoResponse for ApiError {
 pub async fn blocking<T: Send + 'static>(
     f: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
 ) -> Result<T, ApiError> {
-    tokio::task::spawn_blocking(f)
-        .await
-        .unwrap_or_else(|err| Err(ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("{err}"))))
+    // Held until it's done, even if the request's given up on.
+    let turn = queries().acquire_owned().await.expect("the semaphore is never closed");
+    tokio::task::spawn_blocking(move || {
+        let _turn = turn;
+        f()
+    })
+    .await
+    .unwrap_or_else(|err| {
+        tracing::error!("serving a request: {err}");
+        Err(ApiError(StatusCode::INTERNAL_SERVER_ERROR, "Internal error".into()))
+    })
 }
 
 async fn status(axum::extract::State(state): axum::extract::State<AppState>) -> Json<serde_json::Value> {
@@ -119,18 +128,66 @@ async fn cors(request: axum::extract::Request, next: axum::middleware::Next) -> 
     response
 }
 
+/// The most connections served at once.
+const MAX_CONNECTIONS: usize = 1024;
+/// The most requests reading the store at once; more wait their turn.
+const MAX_QUERIES: usize = 64;
+/// How long a client may take to send a request's headers.
+const HEADER_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a request may take to be answered.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
+fn queries() -> Arc<tokio::sync::Semaphore> {
+    static QUERIES: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    QUERIES.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(MAX_QUERIES))).clone()
+}
+
+async fn time_out(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    match tokio::time::timeout(REQUEST_TIMEOUT, next.run(request)).await {
+        Ok(response) => response,
+        Err(_) => ApiError(StatusCode::SERVICE_UNAVAILABLE, "Timed out".into()).into_response(),
+    }
+}
+
 pub async fn serve(
     addr: SocketAddr,
     state: AppState,
     extras: Extras,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
+    use hyper_util::rt::{TokioIo, TokioTimer};
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("serving the API on http://{addr}");
-    axum::serve(listener, router(state, extras))
-        .with_graceful_shutdown(async move {
-            let _ = shutdown.changed().await;
-        })
-        .await?;
-    Ok(())
+    let app = router(state, extras).layer(axum::middleware::from_fn(time_out));
+    let connections = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
+    loop {
+        let (stream, peer) = tokio::select! {
+            accepted = listener.accept() => match accepted {
+                Ok(accepted) => accepted,
+                Err(err) => {
+                    // Out of file descriptors, most likely: wait for some to close.
+                    tracing::warn!("accepting an HTTP connection: {err}");
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    continue;
+                }
+            },
+            _ = shutdown.changed() => return Ok(()),
+        };
+        let Ok(permit) = connections.clone().try_acquire_owned() else {
+            tracing::debug!("too many HTTP connections: closing {peer}'s");
+            continue;
+        };
+        let service = hyper_util::service::TowerToHyperService::new(app.clone());
+        tokio::spawn(async move {
+            let connection = hyper::server::conn::http1::Builder::new()
+                .timer(TokioTimer::new())
+                .header_read_timeout(HEADER_TIMEOUT)
+                .serve_connection(TokioIo::new(stream), service)
+                .with_upgrades();
+            if let Err(err) = connection.await {
+                tracing::debug!("HTTP client {peer}: {err}");
+            }
+            drop(permit);
+        });
+    }
 }

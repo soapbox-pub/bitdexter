@@ -722,12 +722,29 @@ async fn handle(state: &AppState, method: &str, params: Value) -> Result<Value, 
     }
 }
 
+/// The most WebSockets open at once.
+const MAX_SOCKETS: usize = 512;
+/// The largest request a WebSocket may send.
+const MAX_SOCKET_MESSAGE: usize = 64 << 10;
+/// How long a WebSocket may send nothing before it's closed.
+const SOCKET_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
 async fn websocket(State(state): State<AppState>, upgrade: WebSocketUpgrade) -> Response {
-    upgrade.on_upgrade(move |socket| serve_socket(state, socket))
+    static SOCKETS: OnceLock<std::sync::Arc<tokio::sync::Semaphore>> = OnceLock::new();
+    let sockets = SOCKETS.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_SOCKETS)));
+    let Ok(permit) = sockets.clone().try_acquire_owned() else {
+        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "Too many connections").into_response();
+    };
+    upgrade.max_message_size(MAX_SOCKET_MESSAGE).max_frame_size(MAX_SOCKET_MESSAGE).on_upgrade(
+        move |socket| async move {
+            serve_socket(state, socket).await;
+            drop(permit);
+        },
+    )
 }
 
 async fn serve_socket(state: AppState, mut socket: WebSocket) {
-    while let Some(Ok(message)) = socket.recv().await {
+    while let Ok(Some(Ok(message))) = tokio::time::timeout(SOCKET_IDLE_TIMEOUT, socket.recv()).await {
         let Message::Text(text) = message else { continue };
         let Ok(request) = serde_json::from_str::<Value>(&text) else { continue };
         let id = request["id"].clone();

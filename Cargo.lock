@@ -267,6 +267,8 @@ dependencies = [
  "bitcoinkernel",
  "clap",
  "hex",
+ "hyper",
+ "hyper-util",
  "libc",
  "lmdb-master-sys",
  "memmap2",
