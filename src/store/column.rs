@@ -55,14 +55,21 @@ impl Map {
         self.slice(index * self.width as u64, self.width)
     }
 
-    /// Advises the kernel that a range will be read in order soon.
+    /// Advises the kernel that a range will be read in order soon. It's
+    /// asked a piece at a time: Linux reads no more of one request than the
+    /// device's read-ahead, a few megabytes, and drops the rest.
     pub fn will_need(&self, offset: u64, len: usize) {
+        const PIECE: u64 = 2 << 20;
         let page = 4096u64;
-        let start = offset / page * page;
-        let len = (offset - start) as usize + len;
-        // SAFETY: madvise only advises; the range is within the reservation.
-        unsafe {
-            libc::madvise(self.ptr(start) as *mut libc::c_void, len, libc::MADV_WILLNEED);
+        let mut at = offset / page * page;
+        let end = offset + len as u64;
+        while at < end {
+            let piece = PIECE.min(end - at);
+            // SAFETY: madvise only advises; the range is within the reservation.
+            unsafe {
+                libc::madvise(self.ptr(at) as *mut libc::c_void, piece as usize, libc::MADV_WILLNEED);
+            }
+            at += piece;
         }
     }
 }
