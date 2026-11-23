@@ -476,6 +476,9 @@ impl Writer {
             let mut records: Vec<(u64, u64)> =
                 parts.take(n)?.chunks_exact(SPEND_RECORD).map(|r| (read_u40(r), read_u40(&r[5..]))).collect();
             records.sort_unstable();
+            let first = n as u64 * SPEND_RANGE;
+            let len = (SPEND_RANGE.min(outs - first) * OUT_WIDTH as u64) as usize;
+            self.outs.map().will_need(first * OUT_WIDTH as u64, len);
             for (outnum, txnum) in records {
                 self.outs.set(outnum, VALUE_BYTES, &spent_bytes(txnum));
             }

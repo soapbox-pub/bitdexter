@@ -6,6 +6,13 @@
 //! buffer it writes out with [`ColumnWriter::flush`], and may change a
 //! record in place, through the map, as a spend marks an output.
 //!
+//! Columns are read at random, a record or a transaction at a time, so the
+//! map is advised so: the kernel reads only the page a read faults in, not
+//! the hundred kilobytes or more around it it would otherwise. Reading
+//! scripts to verify a block's inputs, on mainnet, that's the difference
+//! between reading a gigabyte from disk a block and a few megabytes. Scans
+//! in order ask for read-ahead with [`Map::will_need`].
+//!
 //! Readers are bounded by the counts of the store's last commit, so they
 //! never read past what's in the file. A column is shortened (on a reorg)
 //! only in the count the writer keeps: the file itself is cut only when the
@@ -100,6 +107,10 @@ impl ColumnWriter {
             file.set_len(want)?;
         }
         let raw = MmapOptions::new().len(RESERVE).map_raw(&file)?;
+        // SAFETY: madvise only advises; the range is the whole map.
+        unsafe {
+            libc::madvise(raw.as_mut_ptr() as *mut libc::c_void, RESERVE, libc::MADV_RANDOM);
+        }
         let map = Arc::new(Map { raw, width });
         let writer = ColumnWriter { file, map: map.clone(), width, flushed: len, pending: Vec::new() };
         Ok((writer, Column(map)))
