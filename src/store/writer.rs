@@ -62,7 +62,14 @@ pub struct Writer {
 
 impl Writer {
     pub fn open(dir: &Path, chain: Chain) -> Result<Writer> {
-        std::fs::create_dir_all(dir.join("index")).with_context(|| format!("making {}", dir.display()))?;
+        // Readable by its owner only, if it's made here: anyone who can
+        // write its files can make what's read from them anything.
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir.join("index"))
+            .with_context(|| format!("making {}", dir.display()))?;
         let lock = lock(dir)?;
         let paths = Paths { dir: dir.to_path_buf() };
         let env = lmdb::Env::open(&dir.join("index"), 1 << 40, 4)?;
