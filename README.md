@@ -219,9 +219,16 @@ the tip, the API is up in 12 seconds. About 1.1 TB was written in all.
 At the tip, blocks, transactions, outspends, merkle proofs and addresses
 compared with mempool.space all match, busy ones too. An address's history
 takes about a second for one with tens of thousands of transactions, 13 for
-the genesis block's. Before the mempool was saved, bootstrapped and kept
-orphans, it held 1,800 transactions minutes after a restart against
-mempool.space's 70,000, and 19,000 a day later against its 65,000.
+the genesis block's.
+
+Before the mempool was saved, bootstrapped and kept orphans, it held 1,800
+transactions minutes after a restart against mempool.space's 70,000, and
+19,000 a day later against its 65,000. Bootstrapped from mempool.space, it
+held 63,977 of mempool.space's 64,213 transactions 15 minutes later, and 17
+it didn't have; the rest were the newest links of chains of 0.1 sat/vB
+transactions, still arriving. Most of the mempool is such chains, fetched in
+no particular order, so tens of thousands of transactions are orphans for a
+while. Its 39,000 transactions, saved (85 MB), loaded again in 13 seconds.
 
 Synced from testnet4's peers to its tip, 162,719 blocks and 15 million
 transactions, in 13 minutes, merging the bulk index in 5 seconds, then
