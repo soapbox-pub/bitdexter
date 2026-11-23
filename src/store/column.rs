@@ -24,6 +24,7 @@ use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use memmap2::{MmapOptions, MmapRaw};
 
@@ -34,6 +35,9 @@ const RESERVE: usize = 1 << 42;
 pub struct Map {
     raw: MmapRaw,
     width: usize,
+    /// How many bytes of the file have been written: it's never cut while
+    /// mapped, so nothing below this can fault.
+    written: AtomicU64,
 }
 
 impl Map {
@@ -43,11 +47,16 @@ impl Map {
         unsafe { self.raw.as_mut_ptr().add(offset as usize) }
     }
 
-    /// The bytes at `offset`, which must have been written.
+    /// The bytes at `offset`, which must have been written: if they
+    /// haven't, as a corrupt or stale offset would have it, it panics.
     pub fn slice(&self, offset: u64, len: usize) -> &[u8] {
-        assert!(offset as usize + len <= RESERVE);
-        // SAFETY: the range is within the map, and within the file, as
-        // callers only read below the counts committed (see the module docs).
+        let end = offset.checked_add(len as u64);
+        assert!(
+            end.is_some_and(|end| end <= self.written.load(Ordering::Acquire)),
+            "reading {len} bytes at {offset}, past what's been written"
+        );
+        // SAFETY: the range is within what's been written of the file, which
+        // is within the map, and the file is never cut while it's mapped.
         unsafe { std::slice::from_raw_parts(self.ptr(offset), len) }
     }
 
@@ -144,7 +153,7 @@ impl ColumnWriter {
         unsafe {
             libc::madvise(raw.as_mut_ptr() as *mut libc::c_void, RESERVE, libc::MADV_RANDOM);
         }
-        let map = Arc::new(Map { raw, width });
+        let map = Arc::new(Map { raw, width, written: AtomicU64::new(want) });
         let writer = ColumnWriter { file, map: map.clone(), width, flushed: len, pending: Vec::new() };
         Ok((writer, Column(map)))
     }
@@ -214,6 +223,7 @@ impl ColumnWriter {
             self.file.write_all_at(&self.pending, self.flushed * self.width as u64)?;
             self.flushed += (self.pending.len() / self.width) as u64;
             self.pending.clear();
+            self.map.written.fetch_max(self.flushed * self.width as u64, Ordering::Release);
         }
         Ok(())
     }

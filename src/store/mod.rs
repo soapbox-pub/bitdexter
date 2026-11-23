@@ -10,9 +10,10 @@
 //! | `txidx` | transaction | where its compact form starts in `txdata`, its first output number (11 B) |
 //! | `outs` | output | its value, its script's [`ScriptClass`], whether it can be spent, and the number of the transaction that spent it, plus one (12 B) |
 //! | `txdata` | byte | transactions in [compact form](crate::compact) |
-//! | `txid.table` | — | txid → transaction number ([`TxidTable`]) |
+//! | `txid.table` | — | txid → transaction number, by its SipHash under a secret made with the store ([`TxidTable`]) |
 //! | `history` | — | script → the outputs paying it, up to 100 blocks below the tip ([`StaticHistory`]) |
-//! | `index/` | — | LMDB: script → the outputs paying it, for the newest blocks; and the store's state |
+//! | `index/` | — | LMDB: script → the outputs paying it, for the newest blocks; the store's state; and the txid table's secret |
+//! | `LOCK` | — | locked while a process has the store open |
 //!
 //! An address's history is the outputs paying its script, from `history`
 //! and LMDB, and the transactions that spent them, from `outs`, so inputs
@@ -87,7 +88,7 @@ const UNSPENDABLE: u64 = 1 << 55;
 pub const REORG_DEPTH: u32 = 100;
 
 /// The format the files are in, bumped when it changes.
-const FORMAT: u32 = 3;
+const FORMAT: u32 = 4;
 
 fn read_le(bytes: &[u8]) -> u64 {
     let mut buf = [0u8; 8];
@@ -400,6 +401,11 @@ impl Paths {
     pub fn sort_dir(&self) -> PathBuf {
         self.file("sort")
     }
+
+    /// Waits until renames in the directory are on disk.
+    pub fn sync_dir(&self) -> std::io::Result<()> {
+        std::fs::File::open(&self.dir)?.sync_all()
+    }
 }
 
 impl Store {
@@ -480,10 +486,12 @@ impl Store {
     }
 
     /// Transaction `txnum` in compact form, and its first output's number.
+    /// If a reorg has changed it since `snapshot` was taken, what's read
+    /// may be nothing, or not it, but never past what's been written.
     pub fn tx_bytes(&self, txnum: u64, snapshot: &Snapshot) -> (&[u8], u64) {
         let (start, first_out) = self.txidx(txnum);
         let end = if txnum + 1 < snapshot.txs { self.txidx(txnum + 1).0 } else { snapshot.data };
-        (self.data.slice(start, (end - start) as usize), first_out)
+        (self.data.slice(start, end.saturating_sub(start) as usize), first_out)
     }
 
     pub fn tx(&self, txnum: u64, snapshot: &Snapshot) -> Result<CompactTx<'_>> {

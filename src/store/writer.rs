@@ -14,13 +14,33 @@ use super::bulk::Bulk;
 use super::checks::Checks;
 use super::column::ColumnWriter;
 use super::history::StaticHistory;
-use super::txid_table::{TxidTable, key_of};
+use super::txid_table::{Keyer, TxidTable};
 use super::*;
 use crate::block::{Block, Tx};
 use crate::validate::{COINBASE_MATURITY, MAX_MONEY};
 
+/// Takes a lock on `dir`'s lock file, failing if another process holds it.
+fn lock(dir: &Path) -> Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    let path = dir.join("LOCK");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    // SAFETY: flock only takes the descriptor, which `file` keeps open.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        anyhow::bail!("{} is in use by another bitdexter", dir.display());
+    }
+    Ok(file)
+}
+
 pub struct Writer {
     pub store: Arc<Store>,
+    /// Held while the store's open, so no other process opens it too.
+    _lock: std::fs::File,
     pub(super) paths: Paths,
     pub(super) blocks: ColumnWriter,
     pub(super) txids: ColumnWriter,
@@ -43,18 +63,34 @@ pub struct Writer {
 impl Writer {
     pub fn open(dir: &Path, chain: Chain) -> Result<Writer> {
         std::fs::create_dir_all(dir.join("index")).with_context(|| format!("making {}", dir.display()))?;
+        let lock = lock(dir)?;
         let paths = Paths { dir: dir.to_path_buf() };
         let env = lmdb::Env::open(&dir.join("index"), 1 << 40, 4)?;
         let history = env.create_db("history", true)?;
         let meta = env.create_db("meta", false)?;
         let tweaks = env.create_db("tweaks", false)?;
-        let state = {
+        let (state, keyer) = {
             let txn = env.read_txn()?;
-            match txn.get(meta, b"state")? {
-                Some(bytes) => State::decode(bytes)?,
-                None => State::default(),
-            }
+            let state = match txn.get(meta, b"state")? {
+                Some(bytes) => Some(State::decode(bytes)?),
+                None => None,
+            };
+            let keyer = txn.get(meta, b"txid key")?.map(Keyer::from_bytes);
+            (state, keyer)
         };
+        // The txid table's secret, made with the store.
+        let keyer = match (state, keyer) {
+            (_, Some(Some(keyer))) => keyer,
+            (None, None) => {
+                let keyer = Keyer::random();
+                let mut txn = env.write_txn()?;
+                txn.put(meta, b"txid key", &keyer.to_bytes(), false)?;
+                txn.commit()?;
+                keyer
+            }
+            _ => anyhow::bail!("the store's txid key is missing or corrupt: it must be rebuilt"),
+        };
+        let state = state.unwrap_or_default();
         let counts = state.counts;
         let open = |name: &str, width: usize, len: u64| {
             ColumnWriter::open(&dir.join(name), width, len).with_context(|| format!("opening {name}"))
@@ -64,7 +100,7 @@ impl Writer {
         let (txidx_w, txidx) = open("txidx", TXIDX_WIDTH, counts.txs)?;
         let (outs_w, outs) = open("outs", OUT_WIDTH, counts.outs)?;
         let (data_w, data) = open("txdata", 1, counts.data)?;
-        let table = TxidTable::open(&paths.table(), 0)?;
+        let table = TxidTable::open(&paths.table(), 0, keyer)?;
         table.set_count(state.published.txs);
         let static_history = StaticHistory::open(&paths.history())?;
 
@@ -96,6 +132,7 @@ impl Writer {
         });
         let mut writer = Writer {
             store,
+            _lock: lock,
             paths,
             blocks: blocks_w,
             txids: txids_w,
@@ -160,7 +197,7 @@ impl Writer {
 
     /// Marks the state dirty before the first change in place since the
     /// last commit.
-    fn mark_dirty(&mut self) -> Result<()> {
+    pub(super) fn mark_dirty(&mut self) -> Result<()> {
         if !self.state.dirty {
             self.state.dirty = true;
             self.write_state()?;
@@ -329,7 +366,7 @@ impl Writer {
                     match replaced {
                         Some(old) => table.replace(&txid, txnum, old),
                         None => {
-                            table.remove(&txid, txnum, |num| key_of(self.txids.get(num).try_into().unwrap()));
+                            table.remove(&txid, txnum, |num| self.txids.get(num).try_into().unwrap());
                         }
                     }
                 }
@@ -454,9 +491,12 @@ impl Writer {
         let started = Instant::now();
         let path = self.paths.table();
         let new_path = self.paths.file("txid.table.new");
-        bulk::build_table(&self.txids, count, &new_path, &self.paths.sort_dir())?;
+        let keyer = self.store.table().keyer();
+        bulk::build_table(&self.txids, count, &new_path, &self.paths.sort_dir(), keyer)?;
         std::fs::rename(&new_path, &path)?;
-        let table = TxidTable::open(&path, 0)?;
+        // The rename must be on disk before a commit that relies on it.
+        self.paths.sync_dir()?;
+        let table = TxidTable::open(&path, 0, keyer)?;
         table.set_count(count);
         tracing::info!(
             "built the txid table of {count} transactions, {} slots, in {:.1?}",
@@ -468,8 +508,9 @@ impl Writer {
     }
 
     /// Recovers from a batch indexed in place that was never committed:
-    /// every spend by a transaction past the state's counts is unmarked, and
-    /// the txid table rebuilt.
+    /// every spend by a transaction past the state's counts is unmarked,
+    /// the last block's spends are marked again, in case it was being taken
+    /// off, and the txid table rebuilt.
     fn recover(&mut self) -> Result<()> {
         let counts = self.state.counts;
         tracing::warn!("the store wasn't committed cleanly; recovering it to block {}", counts.blocks);
@@ -479,6 +520,20 @@ impl Writer {
             ahead.at(outnum);
             if decode_out(self.outs.get(outnum)).spent.is_some_and(|by| by >= counts.txs) {
                 self.outs.set(outnum, VALUE_BYTES, &[0; 5]);
+            }
+        }
+        // `disconnect_tip` unmarks the last block's spends before the commit
+        // that takes it off, so they may be gone while it's still here.
+        if let Some(height) = counts.blocks.checked_sub(1) {
+            let first_tx = self.block(height).first_tx;
+            for txnum in first_tx..counts.txs {
+                let (start, first_out) = decode_txidx(self.txidx.get(txnum));
+                let end = if txnum + 1 < counts.txs { decode_txidx(self.txidx.get(txnum + 1)).0 } else { counts.data };
+                let bytes = self.data.range(start, (end - start) as usize).into_owned();
+                let tx = compact::decode(&bytes, first_out)?;
+                for outnum in tx.inputs.iter().filter_map(|input| input.spent) {
+                    self.outs.set(outnum, VALUE_BYTES, &spent_bytes(txnum));
+                }
             }
         }
         self.outs.sync()?;
@@ -562,7 +617,7 @@ impl Writer {
                 }
             }
             let txid: Hash = self.txids.get(txnum).try_into().unwrap();
-            table.remove(&txid, txnum, |num| key_of(self.txids.get(num).try_into().unwrap()));
+            table.remove(&txid, txnum, |num| self.txids.get(num).try_into().unwrap());
         }
         let data_start =
             if record.first_tx < counts.txs { decode_txidx(self.txidx.get(record.first_tx)).0 } else { counts.data };

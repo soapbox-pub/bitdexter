@@ -4,18 +4,19 @@
 //! of each input's spent output and spending transaction (10 bytes), and
 //! `history.log`, of each spendable output's script key and number (13
 //! bytes). Inputs are found without the txid table, in a map in memory of
-//! the transactions that have outputs left to spend: from the first 8 bytes
-//! of their txid to their number and how many are left. Which outputs are
+//! the transactions that have outputs left to spend: from their txid's key
+//! (see [`txid_table::Keyer`]) to their number and how many are left. Which outputs are
 //! spent is a bitmap, a bit an output, with those that can never be spent
 //! set from the start. On mainnet, the map holds about a hundred million
 //! transactions, a couple of gigabytes, and the bitmap a few hundred
 //! megabytes. Both are rebuilt from the columns and logs when the store's
 //! opened.
 //!
-//! Two transactions in the map can share their first 8 bytes. Then the
-//! entry is marked ambiguous, and both are kept, by their whole txid, in a
-//! second map. A txid looked up isn't checked against the txid column: in
-//! a valid chain, every input spends a transaction that's in the map.
+//! Two transactions in the map can share their key. Then the entry is
+//! marked ambiguous, and both are kept, by their whole txid, in a second
+//! map. A txid found is checked against the txid column, so that an input
+//! spending a transaction that isn't there can't spend one that shares its
+//! key instead.
 //!
 //! Once caught up, [`Writer::finish_bulk`] merges the logs in, with
 //! sequential passes: spends are split by output number into ranges of
@@ -38,7 +39,7 @@ use super::checks::Checks;
 use super::column::ColumnWriter;
 use super::history::{Builder, StaticHistory};
 use super::sort::{Partitions, read_u40, u40};
-use super::txid_table::{self, TableBuilder, key_of};
+use super::txid_table::{self, Keyer, TableBuilder};
 use super::writer::Writer;
 use super::*;
 use crate::block::Block;
@@ -53,7 +54,7 @@ const COUNT_BITS: u32 = 24;
 /// them: 64 million, a range of 768 MB of `outs`.
 const SPEND_RANGE: u64 = 64 << 20;
 
-/// Txids are random already: their first 8 bytes are the hash.
+/// Txids' keys are SipHash under a secret already: they're the hash.
 #[derive(Default)]
 pub struct IdHasher(u64);
 
@@ -136,6 +137,7 @@ fn read_log(path: &Path, record: usize, len: u64, mut f: impl FnMut(&[u8]) -> Re
 }
 
 pub struct Bulk {
+    keyer: Keyer,
     live: IdMap,
     ambiguous: HashMap<Hash, u64>,
     /// A bit an output, set if it's spent or can't be.
@@ -167,7 +169,7 @@ impl Bulk {
 
     /// The map's entry for `txid`.
     fn find(&self, txid: &Hash) -> Option<u64> {
-        match self.live.get(&key_of(txid)) {
+        match self.live.get(&self.keyer.key(txid)) {
             Some(&AMBIGUOUS) => self.ambiguous.get(txid).copied(),
             other => other.copied(),
         }
@@ -175,7 +177,7 @@ impl Bulk {
 
     /// Sets the entry for `txid`, or removes it with `None`.
     fn set(&mut self, txid: &Hash, value: Option<u64>) {
-        let key = key_of(txid);
+        let key = self.keyer.key(txid);
         if self.live.get(&key) == Some(&AMBIGUOUS) {
             match value {
                 Some(value) => self.ambiguous.insert(*txid, value),
@@ -191,7 +193,7 @@ impl Bulk {
 
     /// Adds `txid`, whose key may already be another's, as `other`'s.
     fn add(&mut self, txid: &Hash, value: u64, other: Option<(Hash, u64)>) {
-        let key = key_of(txid);
+        let key = self.keyer.key(txid);
         match other {
             Some((other_txid, other_value)) => {
                 self.live.insert(key, AMBIGUOUS);
@@ -220,6 +222,7 @@ impl Bulk {
         let spends = Log::open(&writer.paths.file("spends.log"), SPEND_RECORD, state.spends_logged)?;
         let history = Log::open(&writer.paths.file("history.log"), HISTORY_RECORD, state.history_logged)?;
         let mut bulk = Bulk {
+            keyer: writer.store.table().keyer(),
             live: IdMap::default(),
             ambiguous: HashMap::new(),
             spent: vec![0; counts.outs.div_ceil(64) as usize],
@@ -264,7 +267,7 @@ impl Bulk {
     /// Another transaction in the map whose txid shares `txid`'s key but
     /// isn't it, and its entry.
     fn other_with_key(&self, writer: &Writer, txid: &Hash) -> Option<(Hash, u64)> {
-        let &value = self.live.get(&key_of(txid))?;
+        let &value = self.live.get(&self.keyer.key(txid))?;
         if value == AMBIGUOUS {
             return None;
         }
@@ -341,7 +344,13 @@ impl Writer {
                     let prev = value >> COUNT_BITS;
                     let (first, next) = self.outputs_of(prev);
                     let outnum = first + input.prev_vout as u64;
-                    if outnum >= next || bulk.is_spent(outnum) {
+                    // Not the genesis block's coinbase, which can't be spent, and
+                    // the transaction it names, not another sharing its key.
+                    if prev == 0
+                        || outnum >= next
+                        || bulk.is_spent(outnum)
+                        || self.txids.get(prev) != &input.prev_txid[..]
+                    {
                         return reject("bad-txns-inputs-missingorspent");
                     }
                     if self.immature_coinbase(prev, height, block_first_tx) {
@@ -582,6 +591,8 @@ impl Writer {
         }
         let entries = builder.finish()?;
         std::fs::rename(&new_path, self.paths.history())?;
+        // The rename must be on disk before LMDB forgets what it moved.
+        self.paths.sync_dir()?;
         let history = StaticHistory::open(&self.paths.history())?;
         *self.store.static_history.write().unwrap() = Arc::new(history);
         tracing::info!("the history index holds {entries} entries");
@@ -610,24 +621,34 @@ impl Writer {
 }
 
 /// Builds a txid table at `path` for the first `count` transactions in
-/// `txids`, by sorting their keys.
-pub fn build_table(txids: &ColumnWriter, count: u64, path: &Path, sort_dir: &Path) -> Result<()> {
+/// `txids`, by sorting their keys under `keyer`.
+pub fn build_table(txids: &ColumnWriter, count: u64, path: &Path, sort_dir: &Path, keyer: Keyer) -> Result<()> {
     let mut capacity = txid_table::capacity_for(count);
     // Keys bunched up near the end can overrun the overflow slots, as good
     // as never: then it's built again, bigger.
-    while !try_build_table(txids, count, path, sort_dir, capacity)? {
+    for _ in 0..TableBuilder::max_builds() {
+        if try_build_table(txids, count, path, sort_dir, capacity, keyer)? {
+            return Ok(());
+        }
         capacity += capacity / 4;
     }
-    Ok(())
+    anyhow::bail!("the txid table's keys bunch up past its end however big it's built")
 }
 
-fn try_build_table(txids: &ColumnWriter, count: u64, path: &Path, sort_dir: &Path, capacity: u64) -> Result<bool> {
+fn try_build_table(
+    txids: &ColumnWriter,
+    count: u64,
+    path: &Path,
+    sort_dir: &Path,
+    capacity: u64,
+    keyer: Keyer,
+) -> Result<bool> {
     let mut ahead = txids.read_ahead(0, count);
     let mut parts = Partitions::create(sort_dir, "txids", 256, 13)?;
     for txnum in 0..count {
         ahead.at(txnum);
         let txid: Hash = txids.get(txnum).try_into().unwrap();
-        let key = key_of(&txid);
+        let key = keyer.key(&txid);
         let mut record = [0u8; 13];
         record[..8].copy_from_slice(&key.to_le_bytes());
         record[8..].copy_from_slice(&u40(txnum));

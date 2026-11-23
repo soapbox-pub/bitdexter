@@ -65,8 +65,19 @@ impl StaticHistory {
         }
         let bits = u32::from_le_bytes(map[8..12].try_into().unwrap());
         let entries = u64::from_le_bytes(map[16..24].try_into().unwrap());
-        if bits > 30 || map.len() < HEADER + ((1usize << bits) + 1) * 8 {
-            return Err(std::io::Error::other(format!("{} is corrupt", path.display())));
+        let corrupt = || std::io::Error::other(format!("{} is corrupt", path.display()));
+        if !(1..=30).contains(&bits) || map.len() < HEADER + ((1usize << bits) + 1) * 8 {
+            return Err(corrupt());
+        }
+        // Each bucket's start, at or after the one before, and within the file.
+        let data = HEADER + ((1usize << bits) + 1) * 8;
+        let mut last = 0;
+        for at in (HEADER..data).step_by(8) {
+            let offset = u64::from_le_bytes(map[at..at + 8].try_into().unwrap());
+            if offset < last || offset > (map.len() - data) as u64 {
+                return Err(corrupt());
+            }
+            last = offset;
         }
         Ok(StaticHistory { map: Some(map), bits, entries })
     }
@@ -112,7 +123,7 @@ impl StaticHistory {
             let mut out = 0u64;
             for i in 0..count {
                 let Ok(n) = r.varint() else { return };
-                out = if i == 0 { n } else { out + n };
+                out = if i == 0 { n } else { out.wrapping_add(n) };
                 outs.push(out);
             }
             if !f(key, &outs) {

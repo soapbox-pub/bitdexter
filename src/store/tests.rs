@@ -158,3 +158,43 @@ fn rejects_bad_blocks_in_place() {
 fn rejects_bad_blocks_in_bulk() {
     rejects_bad_scripts(true);
 }
+
+/// A store is opened by one process at a time; and one left dirty while
+/// its last block was being taken off, with that block's spends unmarked
+/// but the block still committed, has them marked again when reopened.
+#[test]
+fn locks_and_recovers_a_disconnect_cut_short() {
+    let dir = std::env::temp_dir().join(format!("bitdexter-store-{}-recover", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut writer = Store::open(&dir, Chain::Regtest).unwrap();
+    assert!(Store::open(&dir, Chain::Regtest).is_err(), "opened twice");
+    let mut chain = TestChain::new();
+    connect(&mut writer, &chain.blocks[0], true).unwrap();
+    for _ in 0..101 {
+        let block = chain.block(vec![]);
+        connect(&mut writer, &block, true).unwrap();
+        chain.blocks.push(block);
+    }
+    let good = chain.block(vec![chain.spend(1, Builder::new().push_int(2).into_script(), 0)]);
+    connect(&mut writer, &good, true).unwrap();
+    writer.commit().unwrap();
+
+    let store = writer.store.clone();
+    let snapshot = store.snapshot();
+    let spent = store.txnum(&chain.blocks[1].txdata[0].compute_txid().to_byte_array()).unwrap();
+    let outnum = store.tx_bytes(spent, &snapshot).1;
+    assert!(store.output(outnum, &snapshot).1.is_some());
+    // What `disconnect_tip` does before it commits, then a crash.
+    writer.mark_dirty().unwrap();
+    writer.outs.set(outnum, VALUE_BYTES, &[0; 5]);
+    writer.outs.sync().unwrap();
+    drop((writer, store));
+
+    let writer = Store::open(&dir, Chain::Regtest).unwrap();
+    let snapshot = writer.store.snapshot();
+    assert_eq!(snapshot.blocks, 103);
+    let spender = writer.store.output(outnum, &snapshot).1.expect("the spend marked again");
+    assert_eq!(writer.store.txid(spender), good.txdata[1].compute_txid().to_byte_array());
+    drop(writer);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
