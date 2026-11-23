@@ -76,6 +76,9 @@ const FEE_TARGETS: [u32; 28] =
 pub(crate) const FEE_FLOOR: f64 = 1.0;
 /// Unconfirmed transactions in a page of an address's.
 const MEMPOOL_PAGE: usize = 50;
+/// The most outputs an address may have been paid for its history to be
+/// served, as electrs limits it: more would take too long to read.
+pub(crate) const MAX_HISTORY: usize = 50_000;
 
 /// A transaction, confirmed or not.
 pub(crate) enum Found<'m> {
@@ -101,9 +104,20 @@ impl<'a> Ctx<'a> {
     }
 
     /// The transaction with `txid`, in a block or the mempool.
+    /// Block `height`, if it's in the snapshot read.
+    pub fn block(&self, height: u32) -> Option<crate::store::BlockRecord> {
+        self.store.block_in(height, &self.snap)
+    }
+
+    /// The number of the transaction with `txid`, if it's in the snapshot
+    /// read.
+    pub fn txnum_of(&self, txid: &Hash) -> Option<u64> {
+        self.store.txnum(txid).filter(|&n| n < self.snap.txs)
+    }
+
     pub fn find(&self, txid: &str) -> Result<Found<'_>, ApiError> {
         let hash = from_hex_rev(txid).ok_or_else(|| ApiError::bad_request("Invalid hex string"))?;
-        if let Some(txnum) = self.store.txnum(&hash) {
+        if let Some(txnum) = self.txnum_of(&hash) {
             return Ok(Found::Confirmed(txnum));
         }
         self.mempool.get(&hash).map(Found::Unconfirmed).ok_or_else(|| ApiError::not_found("Transaction not found"))
@@ -115,12 +129,15 @@ impl<'a> Ctx<'a> {
 
     pub fn block_height(&self, hash: &str) -> Result<u32, ApiError> {
         let hash = from_hex_rev(hash).ok_or_else(|| ApiError::bad_request("Invalid hex string"))?;
-        self.store.height_of(&hash).ok_or_else(|| ApiError::not_found("Block not found"))
+        self.store
+            .height_of(&hash)
+            .filter(|&h| h < self.snap.blocks)
+            .ok_or_else(|| ApiError::not_found("Block not found"))
     }
 
     fn txnum(&self, txid: &str) -> Result<u64, ApiError> {
         let txid = from_hex_rev(txid).ok_or_else(|| ApiError::bad_request("Invalid hex string"))?;
-        self.store.txnum(&txid).ok_or_else(|| ApiError::not_found("Transaction not found"))
+        self.txnum_of(&txid).ok_or_else(|| ApiError::not_found("Transaction not found"))
     }
 
     pub fn tx(&self, txnum: u64) -> Result<CompactTx<'a>, ApiError> {
@@ -148,13 +165,13 @@ impl<'a> Ctx<'a> {
 
     pub fn mediantime(&self, height: u32) -> u32 {
         let mut times: Vec<u32> =
-            (height.saturating_sub(10)..=height).filter_map(|h| self.store.block(h)).map(|b| b.time()).collect();
+            (height.saturating_sub(10)..=height).filter_map(|h| self.block(h)).map(|b| b.time()).collect();
         times.sort_unstable();
         times[times.len() / 2]
     }
 
     fn status(&self, height: u32) -> Value {
-        let block = self.store.block(height).expect("a block below the tip");
+        let block = self.block(height).expect("a block below the tip");
         json!({
             "confirmed": true,
             "block_height": height,
@@ -164,7 +181,7 @@ impl<'a> Ctx<'a> {
     }
 
     fn block_json(&self, height: u32) -> Value {
-        let block = self.store.block(height).expect("a block below the tip");
+        let block = self.block(height).expect("a block below the tip");
         let header: bitcoin::block::Header = bitcoin::consensus::deserialize(&block.header).expect("a header");
         let mut value = json!({
             "id": to_hex_rev(&block.hash()),
@@ -367,7 +384,7 @@ async fn tip_hash(State(state): State<AppState>) -> Result<Response, ApiError> {
     blocking(move || {
         let ctx = Ctx::new(&state);
         let tip = ctx.tip()?;
-        Ok(text(to_hex_rev(&ctx.store.block(tip).unwrap().hash())))
+        Ok(text(to_hex_rev(&ctx.block(tip).unwrap().hash())))
     })
     .await
 }
@@ -393,7 +410,7 @@ async fn block_at_height(State(state): State<AppState>, Path(height): Path<Strin
     let height: u32 = height.parse().map_err(|_| ApiError::bad_request("Invalid height"))?;
     blocking(move || {
         let ctx = Ctx::new(&state);
-        let block = ctx.store.block(height).ok_or_else(|| ApiError::not_found("Block not found"))?;
+        let block = ctx.block(height).ok_or_else(|| ApiError::not_found("Block not found"))?;
         Ok(text(to_hex_rev(&block.hash())))
     })
     .await
@@ -412,7 +429,7 @@ async fn block_header(State(state): State<AppState>, Path(hash): Path<String>) -
     blocking(move || {
         let ctx = Ctx::new(&state);
         let height = ctx.block_height(&hash)?;
-        Ok(text(hex::encode(ctx.store.block(height).unwrap().header)))
+        Ok(text(hex::encode(ctx.block(height).unwrap().header)))
     })
     .await
 }
@@ -424,7 +441,7 @@ async fn block_status(State(state): State<AppState>, Path(hash): Path<String>) -
             return Ok(Json(json!({ "in_best_chain": false })).into_response());
         };
         let mut status = json!({ "in_best_chain": true, "height": height });
-        if let Some(next) = ctx.store.block(height + 1) {
+        if let Some(next) = ctx.block(height + 1) {
             status["next_best"] = json!(to_hex_rev(&next.hash()));
         }
         Ok(Json(status).into_response())
@@ -434,7 +451,7 @@ async fn block_status(State(state): State<AppState>, Path(hash): Path<String>) -
 
 /// The transaction numbers block `height` holds.
 fn block_txnums(ctx: &Ctx<'_>, height: u32) -> std::ops::Range<u64> {
-    let first = ctx.store.block(height).unwrap().first_tx;
+    let first = ctx.block(height).unwrap().first_tx;
     first..first + ctx.store.tx_count(height, &ctx.snap)
 }
 
@@ -496,7 +513,7 @@ async fn block_raw(State(state): State<AppState>, Path(hash): Path<String>) -> R
         let ctx = Ctx::new(&state);
         let height = ctx.block_height(&hash)?;
         let txnums = block_txnums(&ctx, height);
-        let mut raw = ctx.store.block(height).unwrap().header.to_vec();
+        let mut raw = ctx.block(height).unwrap().header.to_vec();
         crate::block::write_compact_size(&mut raw, txnums.end - txnums.start);
         for n in txnums {
             raw.extend_from_slice(&ctx.raw_tx(n)?);
@@ -562,7 +579,8 @@ fn found_outspends(ctx: &Ctx<'_>, found: &Found<'_>) -> Result<Vec<Value>, ApiEr
     match found {
         Found::Confirmed(txnum) => {
             let n = ctx.store.output_count(*txnum, &ctx.snap) as u32;
-            (0..n).map(|vout| outspend(ctx, *txnum, vout)).collect()
+            let mut spenders = HashMap::new();
+            (0..n).map(|vout| outspend_with(ctx, *txnum, vout, &mut spenders)).collect()
         }
         Found::Unconfirmed(entry) => {
             Ok((0..entry.outputs.len() as u32).map(|vout| mempool_outspend(ctx, &entry.txid, vout)).collect())
@@ -572,13 +590,26 @@ fn found_outspends(ctx: &Ctx<'_>, found: &Found<'_>) -> Result<Vec<Value>, ApiEr
 
 /// Whether output `vout` of transaction `txnum` is spent, and by what.
 fn outspend(ctx: &Ctx<'_>, txnum: u64, vout: u32) -> Result<Value, ApiError> {
+    outspend_with(ctx, txnum, vout, &mut HashMap::new())
+}
+
+/// The same, keeping in `spenders` the output each input of each spending
+/// transaction looked at spends, as many outputs may share one.
+fn outspend_with(
+    ctx: &Ctx<'_>,
+    txnum: u64,
+    vout: u32,
+    spenders: &mut HashMap<u64, Vec<Option<u64>>>,
+) -> Result<Value, ApiError> {
     let first_out = ctx.store.tx_bytes(txnum, &ctx.snap).1;
     let outnum = first_out + vout as u64;
     let Some(spender) = ctx.store.output(outnum, &ctx.snap).1 else {
         return Ok(mempool_outspend(ctx, &ctx.store.txid(txnum), vout));
     };
-    let tx = ctx.tx(spender)?;
-    let vin = tx.inputs.iter().position(|input| input.spent == Some(outnum)).unwrap_or(0);
+    if let std::collections::hash_map::Entry::Vacant(slot) = spenders.entry(spender) {
+        slot.insert(ctx.tx(spender)?.inputs.iter().map(|input| input.spent).collect());
+    }
+    let vin = spenders[&spender].iter().position(|&spent| spent == Some(outnum)).unwrap_or(0);
     Ok(json!({
         "spent": true,
         "txid": to_hex_rev(&ctx.store.txid(spender)),
@@ -595,8 +626,20 @@ async fn tx_outspend(
     blocking(move || {
         let ctx = Ctx::new(&state);
         let found = ctx.find(&txid)?;
-        let spends = found_outspends(&ctx, &found)?;
-        let spend = spends.into_iter().nth(vout as usize).ok_or_else(|| ApiError::not_found("Output not found"))?;
+        let spend = match &found {
+            Found::Confirmed(txnum) => {
+                if vout as u64 >= ctx.store.output_count(*txnum, &ctx.snap) {
+                    return Err(ApiError::not_found("Output not found"));
+                }
+                outspend(&ctx, *txnum, vout)?
+            }
+            Found::Unconfirmed(entry) => {
+                if vout as usize >= entry.outputs.len() {
+                    return Err(ApiError::not_found("Output not found"));
+                }
+                mempool_outspend(&ctx, &entry.txid, vout)
+            }
+        };
         Ok(Json(spend).into_response())
     })
     .await
@@ -632,7 +675,7 @@ async fn tx_merkleblock_proof(State(state): State<AppState>, Path(txid): Path<St
         let txnum = ctx.txnum(&txid)?;
         let height = ctx.store.tx_height(txnum);
         let header: bitcoin::block::Header =
-            bitcoin::consensus::deserialize(&ctx.store.block(height).unwrap().header).expect("a header");
+            bitcoin::consensus::deserialize(&ctx.block(height).unwrap().header).expect("a header");
         let target = bitcoin::Txid::from_byte_array(ctx.store.txid(txnum));
         let txids: Vec<bitcoin::Txid> =
             block_txnums(&ctx, height).map(|n| bitcoin::Txid::from_byte_array(ctx.store.txid(n))).collect();
@@ -664,28 +707,48 @@ pub(crate) enum ScriptRef {
 }
 
 impl ScriptRef {
-    pub fn key(&self) -> [u8; 8] {
+    /// The script's SHA-256.
+    pub fn hash(&self) -> Hash {
         match self {
-            ScriptRef::Script(script) => crate::store::script_key(script),
-            ScriptRef::Hash(hash) => hash[..8].try_into().unwrap(),
+            ScriptRef::Script(script) => crate::hash::sha256(script),
+            ScriptRef::Hash(hash) => *hash,
         }
     }
 }
 
+/// Whether `script` is the one whose SHA-256 is `hash`. Scripts are
+/// indexed by 8 bytes of it, which other scripts can be made to share, so
+/// what's found by it is checked with this.
+pub(crate) fn is_script(script: &[u8], hash: &Hash) -> bool {
+    crate::hash::sha256(script) == *hash
+}
+
+/// The unconfirmed transactions paying or spending the script whose
+/// SHA-256 is `hash`, newest first.
+pub(crate) fn mempool_txs<'m>(ctx: &'m Ctx<'_>, hash: &Hash) -> Vec<&'m Entry> {
+    let key: [u8; 8] = hash[..8].try_into().unwrap();
+    let mut entries = ctx.mempool.txs_of_script(&key);
+    entries.retain(|entry| {
+        entry.outputs.iter().any(|(_, script)| is_script(script, hash))
+            || entry.prevouts.iter().any(|prevout| is_script(&prevout.script, hash))
+    });
+    entries
+}
+
 /// An address's unconfirmed transactions, newest first, and what they pay
 /// it and spend of it.
-pub(crate) fn mempool_activity<'m>(ctx: &'m Ctx<'_>, key: &[u8; 8]) -> (Vec<&'m Entry>, Value) {
-    let entries = ctx.mempool.txs_of_script(key);
+pub(crate) fn mempool_activity<'m>(ctx: &'m Ctx<'_>, hash: &Hash) -> (Vec<&'m Entry>, Value) {
+    let entries = mempool_txs(ctx, hash);
     let (mut funded, mut funded_sum, mut spent, mut spent_sum) = (0u64, 0u64, 0u64, 0u64);
     for entry in &entries {
         for (value, script) in &entry.outputs {
-            if crate::store::script_key(script) == *key {
+            if is_script(script, hash) {
                 funded += 1;
                 funded_sum += value;
             }
         }
         for prevout in &entry.prevouts {
-            if crate::store::script_key(&prevout.script) == *key {
+            if is_script(&prevout.script, hash) {
                 spent += 1;
                 spent_sum += prevout.value;
             }
@@ -715,15 +778,19 @@ pub(crate) struct History {
 
 impl History {
     pub fn load(ctx: &Ctx<'_>, script: &ScriptRef) -> Result<History, ApiError> {
-        let outnums = match script {
-            ScriptRef::Script(script) => ctx.store.history(script, &ctx.snap)?,
-            ScriptRef::Hash(hash) => ctx.store.history_by_hash(hash, &ctx.snap)?,
-        };
-        let funded = outnums
+        Self::load_within(ctx, script, MAX_HISTORY)
+    }
+
+    /// Loads it if it's been paid no more than `limit` times.
+    pub fn load_within(ctx: &Ctx<'_>, script: &ScriptRef, limit: usize) -> Result<History, ApiError> {
+        let outputs = ctx
+            .store
+            .script_outputs(&script.hash(), &ctx.snap, limit)?
+            .ok_or_else(|| ApiError::bad_request("Too many history entries"))?;
+        let funded = outputs
             .into_iter()
-            .map(|outnum| {
+            .map(|(outnum, txnum)| {
                 let (value, spent) = ctx.store.output(outnum, &ctx.snap);
-                let (txnum, _) = ctx.store.outpoint(outnum, &ctx.snap);
                 (outnum, value, txnum, spent)
             })
             .collect();
@@ -766,7 +833,7 @@ async fn address_stats(
         let by_hash = is_scripthash(&uri);
         let script = script_of(&ctx, &param, by_hash)?;
         let history = History::load(&ctx, &script)?;
-        let (_, mempool_stats) = mempool_activity(&ctx, &script.key());
+        let (_, mempool_stats) = mempool_activity(&ctx, &script.hash());
         let key = if by_hash { "scripthash" } else { "address" };
         Ok(Json(json!({
             key: param,
@@ -791,7 +858,7 @@ fn address_txs_page(
     let script = script_of(&ctx, &param, is_scripthash(&uri))?;
     let mut txs = Vec::new();
     if with_mempool {
-        let (entries, _) = mempool_activity(&ctx, &script.key());
+        let entries = mempool_txs(&ctx, &script.hash());
         txs.extend(entries.into_iter().take(MEMPOOL_PAGE).map(|entry| ctx.entry_json(entry)));
     }
     let history = History::load(&ctx, &script)?;
@@ -838,7 +905,7 @@ async fn address_txs_mempool(
     blocking(move || {
         let ctx = Ctx::new(&state);
         let script = script_of(&ctx, &param, is_scripthash(&uri))?;
-        let (entries, _) = mempool_activity(&ctx, &script.key());
+        let entries = mempool_txs(&ctx, &script.hash());
         let txs: Vec<Value> = entries.into_iter().take(MEMPOOL_PAGE).map(|entry| ctx.entry_json(entry)).collect();
         Ok(Json(txs).into_response())
     })
@@ -854,13 +921,13 @@ async fn address_utxo(
         let ctx = Ctx::new(&state);
         let script = script_of(&ctx, &param, is_scripthash(&uri))?;
         let history = History::load(&ctx, &script)?;
-        let key = script.key();
+        let hash = script.hash();
         // Unconfirmed outputs paying it, then confirmed ones, newest first;
         // none spent by an unconfirmed transaction.
         let mut utxos: Vec<Value> = Vec::new();
-        for entry in ctx.mempool.txs_of_script(&key) {
+        for entry in mempool_txs(&ctx, &hash) {
             for (vout, (value, script)) in entry.outputs.iter().enumerate() {
-                if crate::store::script_key(script) == key && ctx.mempool.spender(&entry.txid, vout as u32).is_none() {
+                if is_script(script, &hash) && ctx.mempool.spender(&entry.txid, vout as u32).is_none() {
                     utxos.push(json!({
                         "txid": to_hex_rev(&entry.txid),
                         "vout": vout,

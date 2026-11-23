@@ -22,7 +22,7 @@ use bitcoin::secp256k1::{Secp256k1, VerifyOnly};
 use bitcoin::{Address, Network, NetworkKind};
 use serde_json::{Value, json};
 
-use super::esplora::{Ctx, FEE_FLOOR, Found, History, ScriptRef, mempool_activity};
+use super::esplora::{Ctx, FEE_FLOOR, Found, History, MAX_HISTORY, ScriptRef, is_script, mempool_txs};
 use super::{AppState, blocking};
 use crate::hash::{Hash, to_hex_rev};
 use crate::mempool::Entry;
@@ -30,6 +30,8 @@ use crate::script;
 
 /// Unused addresses in a row that end a scan of a chain.
 const GAP_LIMIT: u32 = 20;
+/// The most addresses an account's scan derives, on all its chains.
+const MAX_ADDRESSES: usize = 5000;
 const DEFAULT_PAGE_SIZE: usize = 1000;
 
 pub fn router() -> Router<AppState> {
@@ -192,7 +194,8 @@ struct Scanned<'m> {
     path: Option<String>,
     history: History,
     mempool: Vec<&'m Entry>,
-    key: [u8; 8],
+    /// Its script's SHA-256.
+    hash: Hash,
 }
 
 impl Scanned<'_> {
@@ -213,12 +216,12 @@ impl Scanned<'_> {
         let mut delta = 0i64;
         for entry in &self.mempool {
             for (value, script) in &entry.outputs {
-                if crate::store::script_key(script) == self.key {
+                if is_script(script, &self.hash) {
                     delta += *value as i64;
                 }
             }
             for prevout in &entry.prevouts {
-                if crate::store::script_key(&prevout.script) == self.key {
+                if is_script(&prevout.script, &self.hash) {
                     delta -= prevout.value as i64;
                 }
             }
@@ -232,14 +235,17 @@ impl Scanned<'_> {
 }
 
 /// Every address a target names: the one, or an account's, scanned up to
-/// the gap limit on each chain.
+/// the gap limit on each chain, up to [`MAX_ADDRESSES`] of them and
+/// [`MAX_HISTORY`] outputs paying them in all.
 fn scan<'m>(ctx: &'m Ctx<'_>, target: &Target) -> Result<Vec<Scanned<'m>>, String> {
-    let load = |address: String, script: Vec<u8>, path: Option<String>| -> Result<Scanned<'m>, String> {
+    let mut history_left = MAX_HISTORY;
+    let mut load = |address: String, script: Vec<u8>, path: Option<String>| -> Result<Scanned<'m>, String> {
         let script = ScriptRef::Script(script);
-        let history = History::load(ctx, &script).map_err(|err| err.1)?;
-        let key = script.key();
-        let (mempool, _) = mempool_activity(ctx, &key);
-        Ok(Scanned { address, path, history, mempool, key })
+        let history = History::load_within(ctx, &script, history_left).map_err(|err| err.1)?;
+        history_left -= history.funded.len();
+        let hash = script.hash();
+        let mempool = mempool_txs(ctx, &hash);
+        Ok(Scanned { address, path, history, mempool, hash })
     };
     match target {
         Target::Address { script, address } => Ok(vec![load(address.clone(), script.clone(), None)?]),
@@ -249,6 +255,9 @@ fn scan<'m>(ctx: &'m Ctx<'_>, target: &Target) -> Result<Vec<Scanned<'m>>, Strin
                 let mut unused = 0;
                 let mut index = 0;
                 while unused < GAP_LIMIT {
+                    if all.len() >= MAX_ADDRESSES {
+                        return Err("Too many addresses to scan".into());
+                    }
                     let (address, script) = account.derive(chain, index, ctx.network)?;
                     let scanned = load(address, script, Some(account.path(chain, index, ctx.network)))?;
                     unused = if scanned.used() { 0 } else { unused + 1 };
@@ -279,16 +288,26 @@ fn tx_json(ctx: &Ctx<'_>, found: &Found<'_>) -> Result<Value, String> {
             let prevouts = ctx.prevouts(&tx);
             let raw = tx.to_raw(&prevouts);
             let mut inputs = Vec::new();
+            // Each transaction spent from, decoded once, however many of its
+            // outputs are spent.
+            let mut decoded: HashMap<u64, crate::compact::CompactTx<'_>> = HashMap::new();
             for (input, (prev_txid, prev_vout)) in tx.inputs.iter().zip(&prevouts) {
                 let prevout = match input.spent {
-                    Some(outnum) => Some(ctx.store.output_script(outnum, &ctx.snap).map_err(|e| e.to_string())?),
+                    Some(outnum) => {
+                        let (prev_txnum, vout) = ctx.store.outpoint(outnum, &ctx.snap);
+                        if let std::collections::hash_map::Entry::Vacant(slot) = decoded.entry(prev_txnum) {
+                            slot.insert(ctx.tx(prev_txnum).map_err(err)?);
+                        }
+                        let out = decoded[&prev_txnum].outputs.get(vout as usize).ok_or("output past its tx's")?;
+                        Some((out.value, out.script.clone()))
+                    }
                     None => None,
                 };
                 inputs.push((*prev_txid, *prev_vout, input.sequence, prevout, input.script_sig.to_vec()));
             }
             let outputs: Vec<(u64, Vec<u8>)> = tx.outputs.into_iter().map(|o| (o.value, o.script)).collect();
             let height = ctx.store.tx_height(*txnum);
-            let record = ctx.store.block(height).unwrap();
+            let record = ctx.block(height).unwrap();
             (ctx.store.txid(*txnum), raw, inputs, outputs, Some((height, record.hash(), record.time())))
         }
         Found::Unconfirmed(entry) => {
@@ -337,6 +356,7 @@ fn tx_json(ctx: &Ctx<'_>, found: &Found<'_>) -> Result<Value, String> {
         })
         .collect();
     let mut vout = Vec::with_capacity(outputs.len());
+    let mut spenders = HashMap::new();
     for (n, (value, script)) in outputs.iter().enumerate() {
         let (addresses, is_address) = addresses(script);
         let mut out = json!({
@@ -346,7 +366,7 @@ fn tx_json(ctx: &Ctx<'_>, found: &Found<'_>) -> Result<Value, String> {
             "addresses": addresses,
             "isAddress": is_address,
         });
-        if let Some((spender, vin, height)) = spender(ctx, found, &txid, n as u32)? {
+        if let Some((spender, vin, height)) = spender(ctx, found, &txid, n as u32, &mut spenders)? {
             out["spent"] = json!(true);
             out["spentTxId"] = json!(to_hex_rev(&spender));
             out["spentIndex"] = json!(vin);
@@ -378,7 +398,7 @@ fn tx_json(ctx: &Ctx<'_>, found: &Found<'_>) -> Result<Value, String> {
         (_, Some((height, hash, time))) => {
             tx["blockHash"] = json!(to_hex_rev(&hash));
             tx["blockHeight"] = json!(height);
-            tx["confirmations"] = json!(tip - height + 1);
+            tx["confirmations"] = json!(tip.saturating_sub(height) + 1);
             tx["blockTime"] = json!(time);
         }
         (Found::Unconfirmed(entry), None) => tx["blockTime"] = json!(entry.time),
@@ -389,17 +409,22 @@ fn tx_json(ctx: &Ctx<'_>, found: &Found<'_>) -> Result<Value, String> {
 
 /// What spends output `vout` of a transaction: its txid, the input that
 /// does, and its block's height if it's confirmed.
+/// `spenders` keeps, for each spending transaction already looked at, the
+/// output each of its inputs spends.
 fn spender(
     ctx: &Ctx<'_>,
     found: &Found<'_>,
     txid: &Hash,
     vout: u32,
+    spenders: &mut HashMap<u64, Vec<Option<u64>>>,
 ) -> Result<Option<(Hash, usize, Option<u32>)>, String> {
     if let Found::Confirmed(txnum) = found {
         let outnum = ctx.store.tx_bytes(*txnum, &ctx.snap).1 + vout as u64;
         if let Some(by) = ctx.store.output(outnum, &ctx.snap).1 {
-            let tx = ctx.tx(by).map_err(|e| e.1)?;
-            let vin = tx.inputs.iter().position(|i| i.spent == Some(outnum)).unwrap_or(0);
+            if let std::collections::hash_map::Entry::Vacant(slot) = spenders.entry(by) {
+                slot.insert(ctx.tx(by).map_err(|e| e.1)?.inputs.iter().map(|i| i.spent).collect());
+            }
+            let vin = spenders[&by].iter().position(|&spent| spent == Some(outnum)).unwrap_or(0);
             return Ok(Some((ctx.store.txid(by), vin, Some(ctx.store.tx_height(by)))));
         }
     }
@@ -454,7 +479,7 @@ fn account_info(ctx: &Ctx<'_>, params: &AccountParams) -> Result<Value, String> 
     });
     let mut found: Vec<Found<'_>> = mempool.iter().map(|e| Found::Unconfirmed(e)).collect();
     found.extend(txnums.iter().map(|&n| Found::Confirmed(n)));
-    let paged: Vec<&Found<'_>> = found.iter().skip((page - 1) * page_size).take(page_size).collect();
+    let paged: Vec<&Found<'_>> = found.iter().skip((page - 1).saturating_mul(page_size)).take(page_size).collect();
     match details {
         "txids" => {
             let txids: Vec<String> = paged
@@ -524,8 +549,7 @@ fn account_utxo(ctx: &Ctx<'_>, descriptor: &str) -> Result<Value, String> {
         };
         for entry in &s.mempool {
             for (vout, (value, script)) in entry.outputs.iter().enumerate() {
-                if crate::store::script_key(script) == s.key && ctx.mempool.spender(&entry.txid, vout as u32).is_none()
-                {
+                if is_script(script, &s.hash) && ctx.mempool.spender(&entry.txid, vout as u32).is_none() {
                     utxos.push(with_address(json!({
                         "txid": to_hex_rev(&entry.txid),
                         "vout": vout,
@@ -542,7 +566,7 @@ fn account_utxo(ctx: &Ctx<'_>, descriptor: &str) -> Result<Value, String> {
                 continue;
             }
             let height = ctx.store.tx_height(txnum);
-            let confirmations = tip - height + 1;
+            let confirmations = tip.saturating_sub(height) + 1;
             let mut utxo = json!({
                 "txid": to_hex_rev(&txid),
                 "vout": vout,
@@ -550,7 +574,7 @@ fn account_utxo(ctx: &Ctx<'_>, descriptor: &str) -> Result<Value, String> {
                 "height": height,
                 "confirmations": confirmations,
             });
-            let coinbase = ctx.store.block(height).is_some_and(|b| b.first_tx == txnum);
+            let coinbase = ctx.block(height).is_some_and(|b| b.first_tx == txnum);
             if coinbase && confirmations < crate::validate::COINBASE_MATURITY {
                 utxo["coinbase"] = json!(true);
             }
@@ -567,14 +591,14 @@ fn block_info(ctx: &Ctx<'_>, id: &str, page: usize, page_size: usize) -> Result<
         Ok(height) => height,
         Err(_) => ctx.block_height(id).map_err(|e| e.1)?,
     };
-    let record = ctx.store.block(height).ok_or("Block not found")?;
+    let record = ctx.block(height).ok_or("Block not found")?;
     let header: bitcoin::block::Header = bitcoin::consensus::deserialize(&record.header).map_err(|e| e.to_string())?;
     let tip = ctx.snap.tip_height().unwrap_or(0);
     let count = ctx.store.tx_count(height, &ctx.snap);
     let page_size = page_size.clamp(1, DEFAULT_PAGE_SIZE);
     let page = page.max(1);
     let txs = (record.first_tx..record.first_tx + count)
-        .skip((page - 1) * page_size)
+        .skip((page - 1).saturating_mul(page_size))
         .take(page_size)
         .map(|n| tx_json(ctx, &Found::Confirmed(n)))
         .collect::<Result<Vec<_>, _>>()?;
@@ -585,7 +609,7 @@ fn block_info(ctx: &Ctx<'_>, id: &str, page: usize, page_size: usize) -> Result<
         "hash": to_hex_rev(&record.hash()),
         "previousBlockHash": header.prev_blockhash.to_string(),
         "height": height,
-        "confirmations": tip - height + 1,
+        "confirmations": tip.saturating_sub(height) + 1,
         "size": record.size,
         "time": header.time,
         "version": header.version.to_consensus(),
@@ -596,7 +620,7 @@ fn block_info(ctx: &Ctx<'_>, id: &str, page: usize, page_size: usize) -> Result<
         "txCount": count,
         "txs": txs,
     });
-    if let Some(next) = ctx.store.block(height + 1) {
+    if let Some(next) = ctx.block(height + 1) {
         block["nextBlockHash"] = json!(to_hex_rev(&next.hash()));
     }
     Ok(block)
@@ -605,8 +629,8 @@ fn block_info(ctx: &Ctx<'_>, id: &str, page: usize, page_size: usize) -> Result<
 fn info(state: &AppState) -> Value {
     let ctx = Ctx::new(state);
     let tip = ctx.snap.tip_height().unwrap_or(0);
-    let best = ctx.store.block(tip).map(|b| to_hex_rev(&b.hash())).unwrap_or_default();
-    let genesis = ctx.store.block(0).map(|b| to_hex_rev(&b.hash())).unwrap_or_default();
+    let best = ctx.block(tip).map(|b| to_hex_rev(&b.hash())).unwrap_or_default();
+    let genesis = ctx.block(0).map(|b| to_hex_rev(&b.hash())).unwrap_or_default();
     let headers = state.status.lock().unwrap().headers;
     json!({
         "name": "Bitcoin",
@@ -685,7 +709,7 @@ async fn handle(state: &AppState, method: &str, params: Value) -> Result<Value, 
         "getBlockHash" => {
             let height = params["height"].as_u64().ok_or("height is required")? as u32;
             let ctx = Ctx::new(state);
-            let block = ctx.store.block(height).ok_or("Block not found")?;
+            let block = ctx.block(height).ok_or("Block not found")?;
             Ok(json!({ "hash": to_hex_rev(&block.hash()) }))
         }
         "estimateFee" => {

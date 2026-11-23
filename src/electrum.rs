@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::api::{Ctx, History, ScriptRef, mempool_activity};
+use crate::api::{Ctx, History, ScriptRef, is_script, mempool_activity};
 use crate::hash::{Hash, from_hex_rev, merkle_branch, sha256, to_hex_rev};
 use crate::mempool;
 use crate::store::Store;
@@ -58,7 +58,7 @@ fn history(ctx: &Ctx<'_>, hash: &Hash) -> Result<Vec<(Hash, i64, Option<u64>)>, 
     txnums.reverse();
     let mut items: Vec<(Hash, i64, Option<u64>)> =
         txnums.into_iter().map(|n| (ctx.store.txid(n), ctx.store.tx_height(n) as i64, None)).collect();
-    let (entries, _) = mempool_activity(ctx, &script.key());
+    let (entries, _) = mempool_activity(ctx, hash);
     let mut unconfirmed: Vec<(Hash, i64, Option<u64>)> =
         entries.into_iter().map(|e| (e.txid, if e.parents.is_empty() { 0 } else { -1 }, Some(e.fee))).collect();
     // Unconfirmed: those with confirmed inputs first, then by txid, so the
@@ -82,7 +82,7 @@ fn status(ctx: &Ctx<'_>, hash: &Hash) -> Result<Value, RpcError> {
 }
 
 fn header_hex(ctx: &Ctx<'_>, height: u32) -> Option<String> {
-    ctx.store.block(height).map(|b| hex::encode(b.header))
+    ctx.block(height).map(|b| hex::encode(b.header))
 }
 
 fn tip_header(ctx: &Ctx<'_>) -> Value {
@@ -129,7 +129,7 @@ impl Server {
             "server.ping" => Ok(Value::Null),
             "server.peers.subscribe" => Ok(json!([])),
             "server.features" => Ok(json!({
-                "genesis_hash": ctx.store.block(0).map(|b| to_hex_rev(&b.hash())),
+                "genesis_hash": ctx.block(0).map(|b| to_hex_rev(&b.hash())),
                 "hosts": {},
                 "protocol_max": PROTOCOL,
                 "protocol_min": PROTOCOL,
@@ -205,7 +205,6 @@ impl Server {
             "blockchain.scripthash.get_balance" | "blockchain.scripthash.listunspent" => {
                 let hash = key_of_scripthash(param_str(params, 0)?)?;
                 let script = ScriptRef::Hash(hash);
-                let key = script.key();
                 let loaded = History::load(&ctx, &script).map_err(|e| bad(e.1))?;
                 let mut confirmed = 0u64;
                 let mut unconfirmed = 0i64;
@@ -226,10 +225,10 @@ impl Server {
                         }));
                     }
                 }
-                let (entries, _) = mempool_activity(&ctx, &key);
+                let (entries, _) = mempool_activity(&ctx, &hash);
                 for entry in entries {
                     for (vout, (value, script)) in entry.outputs.iter().enumerate() {
-                        if crate::store::script_key(script) == key {
+                        if is_script(script, &hash) {
                             unconfirmed += *value as i64;
                             if ctx.mempool.spender(&entry.txid, vout as u32).is_none() {
                                 utxos.push(json!({
@@ -242,7 +241,7 @@ impl Server {
                         }
                     }
                     for prevout in &entry.prevouts {
-                        if crate::store::script_key(&prevout.script) == key {
+                        if is_script(&prevout.script, &hash) {
                             unconfirmed -= prevout.value as i64;
                         }
                     }
@@ -266,9 +265,9 @@ impl Server {
             }
             "blockchain.transaction.get_merkle" => {
                 let txid = from_hex_rev(param_str(params, 0)?).ok_or_else(|| bad("invalid txid"))?;
-                let txnum = ctx.store.txnum(&txid).ok_or_else(|| bad("transaction not found in a block"))?;
+                let txnum = ctx.txnum_of(&txid).ok_or_else(|| bad("transaction not found in a block"))?;
                 let height = ctx.store.tx_height(txnum);
-                let first = ctx.store.block(height).unwrap().first_tx;
+                let first = ctx.block(height).unwrap().first_tx;
                 let txids: Vec<Hash> =
                     (first..first + ctx.store.tx_count(height, &ctx.snap)).map(|n| ctx.store.txid(n)).collect();
                 let pos = (txnum - first) as usize;
@@ -278,7 +277,7 @@ impl Server {
             "blockchain.transaction.id_from_pos" => {
                 let height = param_u32(params, 0)?;
                 let pos = param_u32(params, 1)? as u64;
-                let block = ctx.store.block(height).ok_or_else(|| bad(format!("no block at height {height}")))?;
+                let block = ctx.block(height).ok_or_else(|| bad(format!("no block at height {height}")))?;
                 let count = ctx.store.tx_count(height, &ctx.snap);
                 if pos >= count {
                     return Err(bad("no transaction at that position"));

@@ -427,7 +427,13 @@ impl Store {
     }
 
     pub fn block(&self, height: u32) -> Option<BlockRecord> {
-        (height < self.snapshot().blocks).then(|| BlockRecord::decode(self.blocks.record(height as u64)))
+        self.block_in(height, &self.snapshot())
+    }
+
+    /// Block `height`, if it's in `snapshot`: a reader's, which may be
+    /// behind or ahead of the store's.
+    pub fn block_in(&self, height: u32, snapshot: &Snapshot) -> Option<BlockRecord> {
+        (height < snapshot.blocks).then(|| BlockRecord::decode(self.blocks.record(height as u64)))
     }
 
     pub fn height_of(&self, hash: &Hash) -> Option<u32> {
@@ -446,12 +452,16 @@ impl Store {
         (first_txs.partition_point(|&first| first <= txnum) - 1) as u32
     }
 
-    /// How many transactions block `height` holds.
+    /// How many transactions block `height` holds; none if the chain's
+    /// been cut below it since `snapshot` was taken.
     pub fn tx_count(&self, height: u32, snapshot: &Snapshot) -> u64 {
         let first_txs = self.first_txs.read().unwrap();
-        let first = first_txs[height as usize];
-        let next = if height + 1 < snapshot.blocks { first_txs[height as usize + 1] } else { snapshot.txs };
-        next - first
+        let Some(&first) = first_txs.get(height as usize) else { return 0 };
+        let next = match first_txs.get(height as usize + 1) {
+            Some(&next) if height + 1 < snapshot.blocks => next,
+            _ => snapshot.txs,
+        };
+        next.saturating_sub(first)
     }
 
     pub fn txid(&self, txnum: u64) -> Hash {
@@ -559,12 +569,40 @@ impl Store {
         times.get(times.len() / 2).copied().unwrap_or(0)
     }
 
-    /// The numbers of the outputs paying `script`, in chain order.
+    /// The numbers of the outputs whose script's key is `script`'s, in
+    /// chain order (see [`Store::history_by_hash`]).
     pub fn history(&self, script: &[u8], snapshot: &Snapshot) -> Result<Vec<u64>> {
         self.history_by_hash(&sha256(script), snapshot)
     }
 
-    /// The same, for the script whose SHA-256 is `hash`.
+    /// The outputs paying the script whose SHA-256 is `hash`, in chain
+    /// order, each with the transaction that made it: checked against each
+    /// output's script, as the history's keyed by just 8 bytes of it, which
+    /// scripts can be made to share. `None` if there are more than `limit`,
+    /// before they're checked.
+    pub fn script_outputs(&self, hash: &Hash, snapshot: &Snapshot, limit: usize) -> Result<Option<Vec<(u64, u64)>>> {
+        let outnums = self.history_by_hash(hash, snapshot)?;
+        if outnums.len() > limit {
+            return Ok(None);
+        }
+        let mut found = Vec::with_capacity(outnums.len());
+        let mut decoded: Option<(u64, CompactTx<'_>)> = None;
+        for outnum in outnums {
+            let (txnum, vout) = self.outpoint(outnum, snapshot);
+            if decoded.as_ref().is_none_or(|(n, _)| *n != txnum) {
+                decoded = Some((txnum, self.tx(txnum, snapshot)?));
+            }
+            let tx = &decoded.as_ref().unwrap().1;
+            if tx.outputs.get(vout as usize).is_some_and(|out| sha256(&out.script) == *hash) {
+                found.push((outnum, txnum));
+            }
+        }
+        Ok(Some(found))
+    }
+
+    /// The numbers of the outputs whose script's key is `hash`'s first 8
+    /// bytes, in chain order: those paying the script whose SHA-256 is
+    /// `hash`, and any others whose key is the same.
     pub fn history_by_hash(&self, hash: &Hash, snapshot: &Snapshot) -> Result<Vec<u64>> {
         let key: [u8; 8] = hash[..8].try_into().unwrap();
         let mut outs = self.static_history().lookup(script_key_num(&key));

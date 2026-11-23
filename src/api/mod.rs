@@ -5,7 +5,7 @@ pub mod blindbit;
 pub mod blockbook;
 pub mod esplora;
 
-pub(crate) use esplora::{Ctx, Found, History, ScriptRef, mempool_activity};
+pub(crate) use esplora::{Ctx, Found, History, ScriptRef, is_script, mempool_activity};
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
