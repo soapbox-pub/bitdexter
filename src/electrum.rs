@@ -11,13 +11,14 @@
 //! Only plain TCP is served; put TLS in front of it if it's to be reached
 //! from elsewhere.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::api::{Ctx, History, ScriptRef, is_script, mempool_activity};
@@ -30,12 +31,35 @@ const PROTOCOL: &str = "1.4";
 const MAX_HEADERS: u32 = 2016;
 /// The most bytes a request may be.
 const MAX_LINE: usize = 1 << 20;
+/// The most requests in a batch.
+const MAX_BATCH: usize = 1000;
+/// The most connections at once.
+const MAX_CONNECTIONS: usize = 512;
+/// The most scripts one connection may subscribe to, and all together.
+const MAX_SUBSCRIPTIONS: usize = 20_000;
+const MAX_ALL_SUBSCRIPTIONS: usize = 1_000_000;
+/// How long a connection may send nothing before it's closed. Wallets
+/// ping every few minutes.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// How many blocks' worth of scripts touched are kept, and how many new
+/// blocks are looked through for them rather than every subscription
+/// being checked again.
+const TOUCHED_BLOCKS: usize = 32;
+const MAX_NEW_BLOCKS: u32 = 10;
+
+/// The script keys a block pays or spends.
+type Touched = Arc<HashSet<[u8; 8]>>;
 
 #[derive(Clone)]
 pub struct Server {
     pub store: Arc<Store>,
     pub mempool: mempool::Shared,
     pub mempool_tx: mempool::Submit,
+    /// Subscriptions, all together.
+    subscriptions: Arc<AtomicUsize>,
+    connections: Arc<tokio::sync::Semaphore>,
+    /// The script keys each recent block pays or spends, by block hash.
+    touched: Arc<Mutex<VecDeque<(Hash, Touched)>>>,
 }
 
 struct RpcError(i32, String);
@@ -109,12 +133,59 @@ fn param_u32(params: &Value, i: usize) -> Result<u32, RpcError> {
 #[derive(Default)]
 struct Session {
     headers: bool,
-    last_tip: Option<u32>,
-    /// Each script subscribed to, by script hash, and its last status.
-    scripts: HashMap<String, Value>,
+    last_tip: Option<(u32, Hash)>,
+    /// Each script subscribed to, by its decoded script hash, as it was
+    /// named, and its last status.
+    scripts: HashMap<Hash, (String, Value)>,
+    /// The tip and the mempool's generation the statuses are as of.
+    seen_tip: Option<(u32, Hash)>,
+    seen_mempool: u64,
+}
+
+fn tip_of(ctx: &Ctx<'_>) -> Option<(u32, Hash)> {
+    let height = ctx.snap.tip_height()?;
+    Some((height, ctx.block(height)?.hash()))
 }
 
 impl Server {
+    pub fn new(store: Arc<Store>, mempool: mempool::Shared, mempool_tx: mempool::Submit) -> Server {
+        Server {
+            store,
+            mempool,
+            mempool_tx,
+            subscriptions: Arc::new(AtomicUsize::new(0)),
+            connections: Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS)),
+            touched: Arc::default(),
+        }
+    }
+
+    /// The script keys block `height` pays or spends.
+    fn block_keys(&self, ctx: &Ctx<'_>, height: u32) -> Option<Touched> {
+        let block = ctx.block(height)?;
+        let hash = block.hash();
+        if let Some((_, keys)) = self.touched.lock().unwrap().iter().find(|(h, _)| *h == hash) {
+            return Some(keys.clone());
+        }
+        let mut keys = HashSet::new();
+        for txnum in block.first_tx..block.first_tx + ctx.store.tx_count(height, &ctx.snap) {
+            let tx = ctx.store.tx(txnum, &ctx.snap).ok()?;
+            keys.extend(tx.outputs.iter().map(|out| crate::store::script_key(&out.script)));
+            for input in &tx.inputs {
+                if let Some(outnum) = input.spent {
+                    let (_, script) = ctx.store.output_script(outnum, &ctx.snap).ok()?;
+                    keys.insert(crate::store::script_key(&script));
+                }
+            }
+        }
+        let keys = Arc::new(keys);
+        let mut touched = self.touched.lock().unwrap();
+        touched.push_back((hash, keys.clone()));
+        if touched.len() > TOUCHED_BLOCKS {
+            touched.pop_front();
+        }
+        Some(keys)
+    }
+
     fn ctx(&self) -> Ctx<'_> {
         Ctx::from_parts(&self.store, &self.mempool)
     }
@@ -139,7 +210,7 @@ impl Server {
             })),
             "blockchain.headers.subscribe" => {
                 session.headers = true;
-                session.last_tip = ctx.snap.tip_height();
+                session.last_tip = tip_of(&ctx);
                 Ok(tip_header(&ctx))
             }
             "blockchain.block.header" => {
@@ -170,11 +241,35 @@ impl Server {
             }
             "blockchain.scripthash.subscribe" => {
                 let scripthash = param_str(params, 0)?.to_string();
-                let status = status(&ctx, &key_of_scripthash(&scripthash)?)?;
-                session.scripts.insert(scripthash, status.clone());
+                let hash = key_of_scripthash(&scripthash)?;
+                if !session.scripts.contains_key(&hash) {
+                    if session.scripts.len() >= MAX_SUBSCRIPTIONS {
+                        return Err(bad("too many subscriptions"));
+                    }
+                    if self.subscriptions.fetch_add(1, Ordering::Relaxed) >= MAX_ALL_SUBSCRIPTIONS {
+                        self.subscriptions.fetch_sub(1, Ordering::Relaxed);
+                        return Err(bad("too many subscriptions"));
+                    }
+                }
+                if session.scripts.is_empty() {
+                    session.seen_tip = tip_of(&ctx);
+                    session.seen_mempool = ctx.mempool.generation();
+                }
+                let status = status(&ctx, &hash);
+                if status.is_err() && !session.scripts.contains_key(&hash) {
+                    self.subscriptions.fetch_sub(1, Ordering::Relaxed);
+                }
+                let status = status?;
+                session.scripts.insert(hash, (scripthash, status.clone()));
                 Ok(status)
             }
-            "blockchain.scripthash.unsubscribe" => Ok(json!(session.scripts.remove(param_str(params, 0)?).is_some())),
+            "blockchain.scripthash.unsubscribe" => {
+                let removed = session.scripts.remove(&key_of_scripthash(param_str(params, 0)?)?).is_some();
+                if removed {
+                    self.subscriptions.fetch_sub(1, Ordering::Relaxed);
+                }
+                Ok(json!(removed))
+            }
             "blockchain.scripthash.get_history" => {
                 let items = history(&ctx, &key_of_scripthash(param_str(params, 0)?)?)?;
                 Ok(json!(
@@ -315,12 +410,16 @@ impl Server {
             let method = method.to_string();
             let params = params.clone();
             let mut taken = std::mem::take(session);
+            // A panic answers this request with an error, and keeps the session.
             let (result, back) = tokio::task::spawn_blocking(move || {
-                let result = server.answer(&mut taken, &method, &params);
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    server.answer(&mut taken, &method, &params)
+                }))
+                .unwrap_or_else(|_| Err(RpcError(-32603, "internal error".into())));
                 (result, taken)
             })
             .await
-            .unwrap_or_else(|err| (Err(bad(err.to_string())), Session::default()));
+            .expect("answering doesn't panic past catch_unwind");
             *session = back;
             result
         };
@@ -332,19 +431,56 @@ impl Server {
         }
     }
 
-    /// Notifications for a session's subscriptions that have changed.
+    /// Notifications for a session's subscriptions that have changed:
+    /// those of scripts paid or spent in new blocks or by transactions
+    /// added to or removed from the mempool, or every one if that can't
+    /// be known.
     fn notifications(&self, session: &mut Session) -> Vec<Value> {
         let ctx = self.ctx();
         let mut out = Vec::new();
-        if session.headers && session.last_tip != ctx.snap.tip_height() {
-            session.last_tip = ctx.snap.tip_height();
+        let tip = tip_of(&ctx);
+        if session.headers && session.last_tip != tip {
+            session.last_tip = tip;
             out.push(
                 json!({ "jsonrpc": "2.0", "method": "blockchain.headers.subscribe", "params": [tip_header(&ctx)] }),
             );
         }
-        for (scripthash, last) in session.scripts.iter_mut() {
-            let Ok(hash) = key_of_scripthash(scripthash) else { continue };
-            let Ok(now) = status(&ctx, &hash) else { continue };
+        if session.scripts.is_empty() {
+            return out;
+        }
+        let mut all = false;
+        let mut keys: HashSet<[u8; 8]> = HashSet::new();
+        if session.seen_tip != tip {
+            match (session.seen_tip, tip) {
+                (Some((old, old_hash)), Some((new, _)))
+                    if new >= old
+                        && new - old <= MAX_NEW_BLOCKS
+                        && ctx.block(old).is_some_and(|b| b.hash() == old_hash) =>
+                {
+                    for height in old + 1..=new {
+                        match self.block_keys(&ctx, height) {
+                            Some(touched) => keys.extend(touched.iter()),
+                            None => all = true,
+                        }
+                    }
+                }
+                _ => all = true,
+            }
+            session.seen_tip = tip;
+        }
+        match ctx.mempool.changed_since(session.seen_mempool) {
+            Some(changed) => keys.extend(changed),
+            None => all = true,
+        }
+        session.seen_mempool = ctx.mempool.generation();
+        if !all && keys.is_empty() {
+            return out;
+        }
+        for (hash, (scripthash, last)) in session.scripts.iter_mut() {
+            if !all && !keys.contains(&<[u8; 8]>::try_from(&hash[..8]).unwrap()) {
+                continue;
+            }
+            let Ok(now) = status(&ctx, hash) else { continue };
             if now != *last {
                 *last = now.clone();
                 out.push(json!({
@@ -357,49 +493,77 @@ impl Server {
         out
     }
 
-    async fn serve_connection(self, stream: TcpStream) -> std::io::Result<()> {
-        let (read, mut write) = stream.into_split();
-        let mut lines = BufReader::new(read);
-        let mut session = Session::default();
-        let mut line = String::new();
+    async fn handle_line(&self, session: &mut Session, line: &[u8]) -> Value {
+        let Ok(request) = serde_json::from_slice::<Value>(line) else {
+            return json!({ "jsonrpc": "2.0", "id": null, "error": { "code": -32700, "message": "parse error" } });
+        };
+        match &request {
+            Value::Array(batch) if batch.len() > MAX_BATCH => {
+                json!({ "jsonrpc": "2.0", "id": null, "error": { "code": -32600, "message": "batch too big" } })
+            }
+            Value::Array(batch) => {
+                let mut replies = Vec::with_capacity(batch.len());
+                for request in batch {
+                    replies.push(self.call(session, request).await);
+                }
+                Value::Array(replies)
+            }
+            request => self.call(session, request).await,
+        }
+    }
+
+    async fn serve_connection(&self, stream: TcpStream, session: &mut Session) -> std::io::Result<()> {
+        let (mut read, mut write) = stream.into_split();
+        // Read a chunk at a time, which is safe to interrupt, into a buffer
+        // kept across ticks, and never more than a request may be.
+        let mut buf: Vec<u8> = Vec::new();
+        let mut scanned = 0;
+        let mut chunk = vec![0u8; 64 << 10];
         let mut tick = tokio::time::interval(Duration::from_secs(2));
+        let mut last_request = Instant::now();
         loop {
-            line.clear();
+            if let Some(i) = buf[scanned..].iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = buf.drain(..=scanned + i).collect();
+                scanned = 0;
+                last_request = Instant::now();
+                if line.iter().all(|b| b.is_ascii_whitespace()) {
+                    continue;
+                }
+                let reply = self.handle_line(session, &line).await;
+                write.write_all(format!("{reply}\n").as_bytes()).await?;
+                continue;
+            }
+            scanned = buf.len();
+            if buf.len() > MAX_LINE {
+                return Ok(());
+            }
             tokio::select! {
-                n = lines.read_line(&mut line) => {
-                    if n? == 0 || line.len() > MAX_LINE {
+                n = read.read(&mut chunk) => {
+                    let n = n?;
+                    if n == 0 {
                         return Ok(());
                     }
-                    let Ok(request) = serde_json::from_str::<Value>(line.trim()) else {
-                        let error = json!({ "jsonrpc": "2.0", "id": null, "error": { "code": -32700, "message": "parse error" } });
-                        write.write_all(format!("{error}\n").as_bytes()).await?;
-                        continue;
-                    };
-                    let reply = match &request {
-                        Value::Array(batch) => {
-                            let mut replies = Vec::with_capacity(batch.len());
-                            for request in batch {
-                                replies.push(self.call(&mut session, request).await);
-                            }
-                            Value::Array(replies)
-                        }
-                        request => self.call(&mut session, request).await,
-                    };
-                    write.write_all(format!("{reply}\n").as_bytes()).await?;
+                    buf.extend_from_slice(&chunk[..n]);
                 }
                 _ = tick.tick() => {
+                    if last_request.elapsed() > IDLE_TIMEOUT {
+                        return Ok(());
+                    }
                     if !session.headers && session.scripts.is_empty() {
                         continue;
                     }
                     let server = self.clone();
-                    let mut taken = std::mem::take(&mut session);
+                    let mut taken = std::mem::take(session);
                     let (notes, back) = tokio::task::spawn_blocking(move || {
-                        let notes = server.notifications(&mut taken);
+                        let notes = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            server.notifications(&mut taken)
+                        }))
+                        .unwrap_or_default();
                         (notes, taken)
                     })
                     .await
-                    .unwrap_or_default();
-                    session = back;
+                    .expect("notifying doesn't panic past catch_unwind");
+                    *session = back;
                     for note in notes {
                         write.write_all(format!("{note}\n").as_bytes()).await?;
                     }
@@ -420,12 +584,27 @@ pub async fn serve(
     loop {
         tokio::select! {
             accepted = listener.accept() => {
-                let (stream, peer) = accepted?;
+                let (stream, peer) = match accepted {
+                    Ok(accepted) => accepted,
+                    Err(err) => {
+                        // Out of file descriptors, most likely: wait for some to close.
+                        tracing::warn!("accepting an Electrum connection: {err}");
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                        continue;
+                    }
+                };
+                let Ok(permit) = server.connections.clone().try_acquire_owned() else {
+                    tracing::debug!("too many Electrum connections: closing {peer}'s");
+                    continue;
+                };
                 let server = server.clone();
                 tokio::spawn(async move {
-                    if let Err(err) = server.serve_connection(stream).await {
+                    let mut session = Session::default();
+                    if let Err(err) = server.serve_connection(stream, &mut session).await {
                         tracing::debug!("electrum client {peer}: {err}");
                     }
+                    server.subscriptions.fetch_sub(session.scripts.len(), Ordering::Relaxed);
+                    drop(permit);
                 });
             }
             _ = shutdown.changed() => return Ok(()),

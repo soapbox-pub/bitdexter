@@ -143,11 +143,7 @@ async fn main() -> Result<()> {
         let _ = shutdown_tx.send(true);
     });
     if let Some(addr) = config.electrum {
-        let server = bitdexter::electrum::Server {
-            store: store.clone(),
-            mempool: mempool.clone(),
-            mempool_tx: mempool_tx.clone(),
-        };
+        let server = bitdexter::electrum::Server::new(store.clone(), mempool.clone(), mempool_tx.clone());
         let shutdown = shutdown.clone();
         tokio::spawn(async move {
             if let Err(err) = bitdexter::electrum::serve(addr, server, shutdown).await {
