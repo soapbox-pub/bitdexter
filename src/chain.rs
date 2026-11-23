@@ -26,6 +26,10 @@ const MAX_FUTURE_BLOCK_TIME: u32 = 2 * 60 * 60;
 /// How far before its parent the first block of a period may be, on
 /// networks that rule out the timewarp attack (BIP94).
 const MAX_TIMEWARP: u32 = 600;
+/// How far below the tip a fork from a peer may branch off, once the best
+/// chain has the network's minimum work: deeper, and it has too little
+/// work ever to matter, and could only be spam.
+const MAX_FORK_DEPTH: u32 = 2016;
 
 pub struct Entry {
     pub header: Header,
@@ -45,6 +49,8 @@ pub enum HeaderError {
     Invalid(&'static str),
     /// It's too far ahead of the clock, for now.
     TooNew,
+    /// It branches off too deep below the tip to have work enough.
+    TooDeep,
 }
 
 impl std::fmt::Display for HeaderError {
@@ -53,6 +59,7 @@ impl std::fmt::Display for HeaderError {
             HeaderError::Orphan => f.write_str("doesn't connect to a known header"),
             HeaderError::Invalid(reason) => f.write_str(reason),
             HeaderError::TooNew => f.write_str("time-too-new"),
+            HeaderError::TooDeep => f.write_str("too-little-chainwork"),
         }
     }
 }
@@ -261,8 +268,16 @@ impl HeaderChain {
         Ok(())
     }
 
-    /// Accepts one header, returning whether it's new.
-    fn accept_one(&mut self, header: Header, check_clock: bool) -> Result<bool, HeaderError> {
+    /// Whether the best chain has the network's minimum work.
+    pub fn has_min_work(&self) -> bool {
+        self.tip().work >= self.chain.min_chain_work()
+    }
+
+    /// Accepts one header, returning whether it's new. One from a peer
+    /// (rather than read back from the file) is checked against the clock,
+    /// and mustn't branch off deep below a tip with the minimum work.
+    fn accept_one(&mut self, header: Header, from_peer: bool) -> Result<bool, HeaderError> {
+        let check_clock = from_peer;
         let hash = header.block_hash();
         if let Some(&id) = self.by_hash.get(&hash) {
             return if self.entries[id as usize].invalid {
@@ -272,6 +287,12 @@ impl HeaderChain {
             };
         }
         let &parent_id = self.by_hash.get(&header.prev_blockhash).ok_or(HeaderError::Orphan)?;
+        if from_peer
+            && self.has_min_work()
+            && self.entries[parent_id as usize].height + MAX_FORK_DEPTH < self.tip_height()
+        {
+            return Err(HeaderError::TooDeep);
+        }
         self.check(&header, parent_id, check_clock)?;
         let parent = &self.entries[parent_id as usize];
         let entry = Entry {

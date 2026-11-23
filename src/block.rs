@@ -209,8 +209,9 @@ pub fn read_tx<'a>(r: &mut Reader<'a>, data: &'a [u8]) -> Result<Tx<'a>> {
         segwit = true;
     }
     let io_start = r.pos();
+    // Room for as many as there are bytes left for, at their smallest.
     let n_in = r.length()?;
-    let mut inputs = Vec::with_capacity(n_in);
+    let mut inputs = Vec::with_capacity(n_in.min(r.remaining() / 41));
     for _ in 0..n_in {
         let prev_txid = r.array::<32>()?;
         let prev_vout = r.u32()?;
@@ -219,7 +220,7 @@ pub fn read_tx<'a>(r: &mut Reader<'a>, data: &'a [u8]) -> Result<Tx<'a>> {
         inputs.push(Input { prev_txid, prev_vout, script_sig, sequence, witness: &[] });
     }
     let n_out = r.length()?;
-    let mut outputs = Vec::with_capacity(n_out);
+    let mut outputs = Vec::with_capacity(n_out.min(r.remaining() / 9));
     for _ in 0..n_out {
         let value = r.u64()?;
         let script = r.var_bytes()?;
@@ -302,7 +303,7 @@ pub fn parse_block(data: &[u8]) -> Result<Block<'_>> {
     let mut r = Reader::new(data);
     let header: &[u8; 80] = r.bytes(80)?.try_into().unwrap();
     let n = r.length()?;
-    let mut txs = Vec::with_capacity(n);
+    let mut txs = Vec::with_capacity(n.min(r.remaining() / 60));
     for _ in 0..n {
         txs.push(read_tx(&mut r, data)?);
     }

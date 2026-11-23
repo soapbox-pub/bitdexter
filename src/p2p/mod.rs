@@ -2,9 +2,11 @@
 //!
 //! Each peer's task does the version handshake, answers pings, and passes
 //! every other message to the node as a [`PeerEvent`]. Blocks are passed as
-//! the bytes they came in, unparsed and unhashed (their merkle root is
-//! checked as they're indexed), and everything else as rust-bitcoin's
-//! [`NetworkMessage`].
+//! the bytes they came in, once they're known to hold the transactions,
+//! and witnesses, their header commits to (they're checked in full as
+//! they're indexed), and everything else as rust-bitcoin's
+//! [`NetworkMessage`]. What's sent to a peer waits in a queue of its own,
+//! and a peer that lets it fill, not reading, is dropped.
 
 pub mod addrman;
 
@@ -32,8 +34,24 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 const PING_INTERVAL: Duration = Duration::from_secs(120);
 /// How long a peer may say nothing at all before it's dropped.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+/// The most messages waiting to be sent to a peer.
+pub const MAX_QUEUED: usize = 1024;
+/// The most headers a `headers` message may hold.
+const MAX_HEADERS: usize = 2000;
 
 pub type PeerId = u64;
+
+/// A peer broke the protocol, as an honest one wouldn't: it's banned.
+#[derive(Debug)]
+pub struct Misbehaved(pub String);
+
+impl std::fmt::Display for Misbehaved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Misbehaved {}
 
 #[derive(Debug, Clone)]
 pub struct PeerInfo {
@@ -45,10 +63,10 @@ pub struct PeerInfo {
 }
 
 pub enum PeerEvent {
-    Connected { id: PeerId, info: PeerInfo, commands: mpsc::UnboundedSender<NetworkMessage> },
+    Connected { id: PeerId, info: PeerInfo, commands: mpsc::Sender<NetworkMessage> },
     Message { id: PeerId, message: NetworkMessage },
     Block { id: PeerId, bytes: Vec<u8> },
-    Disconnected { id: PeerId, addr: SocketAddr, reason: String, connected: bool },
+    Disconnected { id: PeerId, addr: SocketAddr, reason: String, connected: bool, misbehaved: bool },
 }
 
 struct Frame {
@@ -115,11 +133,11 @@ fn version_message(addr: SocketAddr, start_height: i32) -> VersionMessage {
 /// to `events`.
 pub async fn run_peer(id: PeerId, addr: SocketAddr, chain: Chain, start_height: i32, events: mpsc::Sender<PeerEvent>) {
     let mut connected = false;
-    let reason = match connect(id, addr, chain, start_height, &events, &mut connected).await {
-        Ok(()) => "closed".to_string(),
-        Err(err) => format!("{err:#}"),
+    let (reason, misbehaved) = match connect(id, addr, chain, start_height, &events, &mut connected).await {
+        Ok(()) => ("closed".to_string(), false),
+        Err(err) => (format!("{err:#}"), err.downcast_ref::<Misbehaved>().is_some()),
     };
-    let _ = events.send(PeerEvent::Disconnected { id, addr, reason, connected }).await;
+    let _ = events.send(PeerEvent::Disconnected { id, addr, reason, connected, misbehaved }).await;
 }
 
 async fn connect(
@@ -172,7 +190,7 @@ async fn connect(
     .context("handshake timed out")??;
 
     write.write_all(&encode(chain, NetworkMessage::SendHeaders)).await?;
-    let (commands_tx, mut commands) = mpsc::unbounded_channel::<NetworkMessage>();
+    let (commands_tx, mut commands) = mpsc::channel::<NetworkMessage>(MAX_QUEUED);
     events.send(PeerEvent::Connected { id, info, commands: commands_tx }).await?;
     *connected = true;
 
@@ -181,7 +199,7 @@ async fn connect(
     // the node's commands and pings now and then. Reading is never
     // interrupted part way through a message, which would lose its place
     // in the stream, except to end the connection.
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(MAX_QUEUED);
     let writer = tokio::spawn(async move {
         while let Some(bytes) = out_rx.recv().await {
             if write.write_all(&bytes).await.is_err() {
@@ -203,7 +221,7 @@ async fn connect(
                     },
                     _ = ping.tick() => NetworkMessage::Ping(rand::random()),
                 };
-                if out_tx.send(encode(chain, message)).is_err() {
+                if out_tx.send(encode(chain, message)).await.is_err() {
                     break;
                 }
             }
@@ -219,12 +237,29 @@ async fn connect(
                 _ = &mut closed => return Ok(()),
             };
             if frame.command() == b"block" {
-                events.send(PeerEvent::Block { id, bytes: frame.payload }).await?;
+                // Only the block its header names, not one padded or cut,
+                // which could be kept a long while before it's indexed.
+                let (checked, payload) = tokio::task::spawn_blocking(move || {
+                    let checked = crate::block::parse_block(&frame.payload)
+                        .map_err(|err| err.to_string())
+                        .and_then(|block| crate::validate::check_commitments(&block).map_err(|err| err.0));
+                    (checked, frame.payload)
+                })
+                .await?;
+                if let Err(reason) = checked {
+                    return Err(Misbehaved(format!("sent a block that isn't its header's: {reason}")).into());
+                }
+                events.send(PeerEvent::Block { id, bytes: payload }).await?;
                 continue;
             }
             match frame.decode() {
                 Ok(NetworkMessage::Ping(nonce)) => {
-                    out_tx.send(encode(chain, NetworkMessage::Pong(nonce)))?;
+                    if out_tx.try_send(encode(chain, NetworkMessage::Pong(nonce))).is_err() {
+                        bail!("isn't reading what's sent it");
+                    }
+                }
+                Ok(NetworkMessage::Headers(headers)) if headers.len() > MAX_HEADERS => {
+                    return Err(Misbehaved(format!("sent {} headers at once", headers.len())).into());
                 }
                 Ok(NetworkMessage::Pong(_)) => {}
                 Ok(message) => events.send(PeerEvent::Message { id, message }).await?,

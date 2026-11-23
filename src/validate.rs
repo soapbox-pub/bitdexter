@@ -181,6 +181,43 @@ fn check_signet(block: &Block<'_>) -> Result<(), Invalid> {
         .map_err(|_| bad())
 }
 
+/// Whether a block's transactions, and their witnesses if it has any, are
+/// the ones its header commits to: what can be checked of a block as it
+/// arrives, before its height is known. A block that isn't was mutated by
+/// whoever sent it, which says nothing of the block itself.
+pub fn check_commitments(block: &Block<'_>) -> Result<(), Invalid> {
+    let txs = &block.txs;
+    let (root, mutated) = merkle_root(txs.iter().map(|tx| tx.txid).collect());
+    if root != block.merkle_root() {
+        return invalid("bad-txnmrklroot");
+    }
+    if mutated {
+        return invalid("bad-txns-duplicate");
+    }
+    if txs.iter().any(|tx| tx.segwit) {
+        let Some(commitment) = witness_commitment(block) else { return invalid("unexpected-witness") };
+        check_witness_commitment(block, &commitment)?;
+    }
+    Ok(())
+}
+
+/// Whether a block's witnesses are the ones its coinbase commits to.
+fn check_witness_commitment(block: &Block<'_>, commitment: &Hash) -> Result<(), Invalid> {
+    let txs = &block.txs;
+    let reserved = txs[0].inputs[0].witness;
+    // One item of 32 bytes: its count, its length, then it.
+    if reserved.len() != 34 || reserved[0] != 1 || reserved[1] != 32 {
+        return invalid("bad-witness-nonce-size");
+    }
+    let mut wtxids: Vec<Hash> = txs.iter().map(|tx| tx.wtxid).collect();
+    wtxids[0] = [0; 32];
+    let (witness_root, _) = merkle_root(wtxids);
+    if sha256d_parts(&[&witness_root, &reserved[2..]]) != *commitment {
+        return invalid("bad-witness-merkle-match");
+    }
+    Ok(())
+}
+
 /// Checks a block, in Bitcoin Core's order: first that its transactions
 /// and their witnesses are the ones its header commits to, so that a peer
 /// can't make a good block look bad by sending it with transactions added,
@@ -250,19 +287,7 @@ pub fn check_block(block: &Block<'_>, height: u32, chain: Chain) -> Result<(), I
     let has_witness = txs.iter().any(|tx| tx.segwit);
     let commitment = if height >= chain.segwit_height() { witness_commitment(block) } else { None };
     match commitment {
-        Some(commitment) => {
-            let reserved = txs[0].inputs[0].witness;
-            // One item of 32 bytes: its count, its length, then it.
-            if reserved.len() != 34 || reserved[0] != 1 || reserved[1] != 32 {
-                return invalid("bad-witness-nonce-size");
-            }
-            let mut wtxids: Vec<Hash> = txs.iter().map(|tx| tx.wtxid).collect();
-            wtxids[0] = [0; 32];
-            let (witness_root, _) = merkle_root(wtxids);
-            if sha256d_parts(&[&witness_root, &reserved[2..]]) != commitment {
-                return invalid("bad-witness-merkle-match");
-            }
-        }
+        Some(commitment) => check_witness_commitment(block, &commitment)?,
         None if has_witness => return invalid("unexpected-witness"),
         None => {}
     }

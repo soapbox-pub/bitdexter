@@ -62,6 +62,12 @@ const MAX_TX_REQUESTS: usize = 200_000;
 /// The most transactions asked of one peer for one announcement, as many
 /// as Bitcoin Core puts in one.
 const MAX_TX_ASKS: usize = 50_000;
+/// Addresses taken from a peer: a burst of this many, as a `getaddr`'s
+/// answer, then one every ten seconds, as Bitcoin Core takes them.
+const ADDR_BURST: f64 = 1000.0;
+const ADDR_RATE: f64 = 0.1;
+/// The most of our transactions sent a peer for one `getdata`.
+const MAX_TX_SENDS: usize = 100;
 
 #[derive(Debug, Clone)]
 pub struct NodeConfig {
@@ -110,7 +116,12 @@ struct Peer {
     info: PeerInfo,
     /// Whether it's been asked for its mempool (BIP35).
     asked_mempool: bool,
-    commands: mpsc::UnboundedSender<NetworkMessage>,
+    commands: mpsc::Sender<NetworkMessage>,
+    /// Addresses it may still tell of, and when that was last figured.
+    addr_tokens: f64,
+    addr_tokens_at: Instant,
+    /// Our transactions it's been sent, which it's sent only once.
+    sent_txs: HashSet<crate::hash::Hash>,
     in_flight: HashSet<BlockHash>,
     /// The best height it's said or shown it has.
     height: u32,
@@ -208,7 +219,7 @@ impl Node {
         let (indexer_tx, indexer_rx) = mpsc::unbounded_channel();
         let (indexer_events_tx, indexer_events) = mpsc::unbounded_channel();
         let indexer_thread = indexer::spawn(writer, config.bulk_threshold, indexer_rx, indexer_events_tx);
-        let addrman = AddrMan::load(data_dir.join("peers.txt"));
+        let addrman = AddrMan::load(data_dir.join("peers.txt"), config.chain == Chain::Regtest);
         tracing::info!("{} headers known, to height {}; {} indexed", headers.len(), headers.tip_height(), sent.len());
         // The genesis block needn't be downloaded.
         let mut received = BTreeMap::new();
@@ -272,7 +283,7 @@ impl Node {
                 Some(addrs) = self.addrs.recv() => {
                     self.seeding = false;
                     for addr in addrs {
-                        self.addrman.add(addr);
+                        self.addrman.add(addr, None);
                     }
                 }
                 _ = tick.tick() => {}
@@ -302,7 +313,7 @@ impl Node {
                 );
                 self.addrman.succeeded(info.addr);
                 if self.addrman.len() < 1000 && !self.config.connect_only {
-                    let _ = commands.send(NetworkMessage::GetAddr);
+                    let _ = commands.try_send(NetworkMessage::GetAddr);
                 }
                 let height = info.start_height.max(0) as u32;
                 self.peers.insert(
@@ -311,6 +322,9 @@ impl Node {
                         info,
                         asked_mempool: false,
                         commands,
+                        addr_tokens: ADDR_BURST,
+                        addr_tokens_at: Instant::now(),
+                        sent_txs: HashSet::new(),
                         in_flight: HashSet::new(),
                         height,
                         headers_asked: None,
@@ -320,9 +334,12 @@ impl Node {
             }
             PeerEvent::Message { id, message } => self.on_message(id, message),
             PeerEvent::Block { id, bytes } => self.on_block(id, bytes),
-            PeerEvent::Disconnected { id, addr, reason, connected } => {
+            PeerEvent::Disconnected { id, addr, reason, connected, misbehaved } => {
                 self.busy.remove(&addr);
-                if connected {
+                if misbehaved {
+                    tracing::info!("banning {addr}: {reason}");
+                    self.addrman.ban(addr);
+                } else if connected {
                     tracing::info!("disconnected from {addr}: {reason}");
                 } else {
                     tracing::debug!("couldn't connect to {addr}: {reason}");
@@ -355,9 +372,22 @@ impl Node {
         }
     }
 
-    fn send(&self, id: PeerId, message: NetworkMessage) {
+    /// Drops a peer that broke the protocol, and bans it for a while.
+    fn misbehaved(&mut self, id: PeerId, why: &str) {
         if let Some(peer) = self.peers.get(&id) {
-            let _ = peer.commands.send(message);
+            tracing::info!("banning {}: {why}", peer.info.addr);
+            self.addrman.ban(peer.info.addr);
+        }
+        self.disconnect(id, why);
+    }
+
+    /// Sends a peer a message, dropping it if it's let what's waiting to be
+    /// sent it pile up.
+    fn send(&mut self, id: PeerId, message: NetworkMessage) {
+        if let Some(peer) = self.peers.get(&id)
+            && peer.commands.try_send(message).is_err()
+        {
+            self.disconnect(id, "isn't reading what's sent it");
         }
     }
 
@@ -366,8 +396,27 @@ impl Node {
         if let Some(peer) = self.peers.get_mut(&id) {
             peer.headers_asked = Some(Instant::now());
             peer.last_headers_poll = Instant::now();
-            let _ =
-                peer.commands.send(NetworkMessage::GetHeaders(GetHeadersMessage::new(locator, BlockHash::all_zeros())));
+        }
+        self.send(id, NetworkMessage::GetHeaders(GetHeadersMessage::new(locator, BlockHash::all_zeros())));
+    }
+
+    /// Takes addresses a peer told of, as many as it may tell of now.
+    fn take_addrs(&mut self, id: PeerId, addrs: impl Iterator<Item = SocketAddr>) {
+        let Some(peer) = self.peers.get_mut(&id) else { return };
+        let elapsed = peer.addr_tokens_at.elapsed().as_secs_f64();
+        peer.addr_tokens = (peer.addr_tokens + elapsed * ADDR_RATE).min(ADDR_BURST);
+        peer.addr_tokens_at = Instant::now();
+        let source = peer.info.addr.ip();
+        let mut taken = Vec::new();
+        for addr in addrs {
+            if peer.addr_tokens < 1.0 {
+                break;
+            }
+            peer.addr_tokens -= 1.0;
+            taken.push(addr);
+        }
+        for addr in taken {
+            self.addrman.add(addr, Some(source));
         }
     }
 
@@ -398,29 +447,30 @@ impl Node {
                 }
             }
             NetworkMessage::GetData(inventory) => {
-                // Peers may ask for the transactions sent them.
+                // Peers may ask for the transactions sent them, each once.
+                let mut sends = Vec::new();
                 for inv in inventory {
+                    if sends.len() >= MAX_TX_SENDS {
+                        break;
+                    }
                     if let Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) = inv
                         && let Some((raw, _)) = self.ours.get(&txid.to_byte_array())
+                        && let Some(peer) = self.peers.get_mut(&id)
+                        && peer.sent_txs.insert(txid.to_byte_array())
                         && let Ok(tx) = bitcoin::consensus::deserialize(raw)
                     {
-                        self.send(id, NetworkMessage::Tx(tx));
+                        sends.push(tx);
                     }
+                }
+                for tx in sends {
+                    self.send(id, NetworkMessage::Tx(tx));
                 }
             }
             NetworkMessage::Addr(addrs) => {
-                for (_, addr) in addrs {
-                    if let Ok(addr) = addr.socket_addr() {
-                        self.addrman.add(addr);
-                    }
-                }
+                self.take_addrs(id, addrs.into_iter().filter_map(|(_, addr)| addr.socket_addr().ok()));
             }
             NetworkMessage::AddrV2(addrs) => {
-                for addr in addrs {
-                    if let Ok(addr) = addr.socket_addr() {
-                        self.addrman.add(addr);
-                    }
-                }
+                self.take_addrs(id, addrs.into_iter().filter_map(|addr| addr.socket_addr().ok()));
             }
             NetworkMessage::NotFound(inventory) => {
                 // A transaction wanted of any peer is asked of the next.
@@ -435,7 +485,9 @@ impl Node {
                     }
                 }
                 for inv in inventory {
+                    // Only what was asked of it: others' requests are theirs.
                     if let Inventory::WitnessBlock(hash) | Inventory::Block(hash) = inv
+                        && self.requested.get(&hash).is_some_and(|request| request.peer == id)
                         && let Some(request) = self.requested.remove(&hash)
                     {
                         if let Some(peer) = self.peers.get_mut(&request.peer) {
@@ -455,9 +507,14 @@ impl Node {
         if let Some(peer) = self.peers.get_mut(&id) {
             peer.headers_asked = None;
         }
+        let tip = self.headers.tip_height();
         if headers.is_empty() {
             if self.header_sync == Some(id) {
                 self.header_sync = None;
+            }
+            // It has nothing past our tip, whatever it said.
+            if let Some(peer) = self.peers.get_mut(&id) {
+                peer.height = peer.height.min(tip);
             }
             return;
         }
@@ -474,26 +531,38 @@ impl Node {
                 if self.headers.tip().hash != before {
                     self.best_changed = true;
                 }
-                if headers.len() == 2000 {
+                if headers.len() == 2000 && new > 0 {
                     self.header_sync = Some(id);
                     self.ask_headers(id);
-                } else if self.header_sync == Some(id) {
-                    self.header_sync = None;
+                } else {
+                    if self.header_sync == Some(id) {
+                        self.header_sync = None;
+                    }
+                    // Headers it's sent before, or not a full batch: it has no
+                    // more, whatever it said.
+                    if let Some(peer) = self.peers.get_mut(&id) {
+                        peer.height = peer.height.min(self.headers.tip_height().max(tip));
+                    }
                 }
                 if new > 0 && self.last_log.elapsed() >= Duration::from_secs(5) {
                     self.last_log = Instant::now();
                     tracing::info!("headers to height {}", self.headers.tip_height());
                 }
             }
-            Err(HeaderError::Orphan) => self.ask_headers(id),
-            Err(HeaderError::TooNew) => {}
-            Err(HeaderError::Invalid(reason)) => self.disconnect(id, &format!("sent an invalid header: {reason}")),
+            // Asked for the headers before it, once at a time.
+            Err(HeaderError::Orphan) => {
+                if self.peers.get(&id).is_some_and(|p| p.headers_asked.is_none()) {
+                    self.ask_headers(id);
+                }
+            }
+            Err(HeaderError::TooNew | HeaderError::TooDeep) => {}
+            Err(HeaderError::Invalid(reason)) => self.misbehaved(id, &format!("sent an invalid header: {reason}")),
         }
     }
 
     fn on_block(&mut self, id: PeerId, bytes: Vec<u8>) {
         if bytes.len() < 80 {
-            return self.disconnect(id, "sent a block too short to be one");
+            return self.misbehaved(id, "sent a block too short to be one");
         }
         let hash = BlockHash::from_byte_array(crate::hash::sha256d(&bytes[..80]));
         let Some(request) = self.requested.remove(&hash) else {
@@ -522,11 +591,11 @@ impl Node {
             }
             indexer::Event::Rejected { height, hash, reason, mutated } => {
                 let from = self.sent_from.remove(&height);
-                if mutated {
-                    if let Some(from) = from {
-                        self.disconnect(from, &format!("sent a mutated block {height}: {reason}"));
-                    }
-                } else {
+                if let Some(from) = from {
+                    let what = if mutated { "a mutated" } else { "an invalid" };
+                    self.misbehaved(from, &format!("sent {what} block {height}: {reason}"));
+                }
+                if !mutated {
                     self.headers.mark_invalid(&hash);
                     self.best_changed = true;
                 }
@@ -697,6 +766,11 @@ impl Node {
         if next > last {
             return;
         }
+        // Not until the headers have the work a real chain has: blocks of a
+        // made-up one would be indexed, and the reorg away from it too deep.
+        if !self.headers.has_min_work() {
+            return;
+        }
         // With the buffer full, only the blocks the indexer needs soonest
         // are asked for: they must be, or nothing would ever free it.
         let in_flight_bytes = self.requested.len() as f64 * self.avg_block;
@@ -822,7 +896,7 @@ impl Node {
             if !peer.asked_mempool && peer.info.services.has(ServiceFlags::BLOOM) {
                 peer.asked_mempool = true;
                 tracing::debug!("asking {} for its mempool", peer.info.addr);
-                let _ = peer.commands.send(NetworkMessage::MemPool);
+                let _ = peer.commands.try_send(NetworkMessage::MemPool);
             }
         }
     }
@@ -832,8 +906,12 @@ impl Node {
         let Ok(tx) = bitcoin::consensus::deserialize::<bitcoin::Transaction>(&raw) else { return };
         let txid = tx.compute_txid();
         tracing::info!("broadcasting {txid} to {} peers", self.peers.len());
-        for peer in self.peers.values() {
-            let _ = peer.commands.send(NetworkMessage::Tx(tx.clone()));
+        let ids: Vec<PeerId> = self.peers.keys().copied().collect();
+        for id in ids {
+            if let Some(peer) = self.peers.get_mut(&id) {
+                peer.sent_txs.insert(txid.to_byte_array());
+            }
+            self.send(id, NetworkMessage::Tx(tx.clone()));
         }
         self.ours.insert(txid.to_byte_array(), (raw, Instant::now()));
     }

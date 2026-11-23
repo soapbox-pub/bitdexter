@@ -118,6 +118,19 @@ impl Chain {
         }
     }
 
+    /// The least work a chain of headers must have for its blocks to be
+    /// downloaded, and for forks deep below its tip to be refused, as
+    /// Bitcoin Core's `nMinimumChainWork`, whose values these are: a chain
+    /// with less is made up, or not yet synced far enough to tell.
+    pub fn min_chain_work(self) -> u128 {
+        match self {
+            Chain::Mainnet => 0x145ec036acc5ba740052af1a0,
+            Chain::Testnet4 => 0xe346a558455ade8eca9,
+            Chain::Signet => 0x1090e9dc1520,
+            Chain::Regtest => 0,
+        }
+    }
+
     /// The rules block `hash` is held to instead of today's, if it's one of
     /// the two that broke them (as Bitcoin Core's `script_flag_exceptions`).
     pub fn script_flag_exception(self, hash: &[u8; 32]) -> Option<crate::consensus::ScriptException> {
