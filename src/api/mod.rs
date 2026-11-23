@@ -68,6 +68,15 @@ async fn status(axum::extract::State(state): axum::extract::State<AppState>) -> 
     let status = state.status.lock().unwrap().clone();
     let usage: serde_json::Map<String, serde_json::Value> =
         state.store.disk_usage().into_iter().map(|(k, v)| (k.to_string(), v.into())).collect();
+    let mempool_stats = {
+        let mempool = state.mempool.read().unwrap();
+        serde_json::json!({
+            "accepted": mempool.stats.accepted,
+            "refused": mempool.stats.refused,
+            "orphaned": mempool.stats.orphaned,
+            "orphans": mempool.stats.orphans,
+        })
+    };
     Json(serde_json::json!({
         "network": state.store.chain.name(),
         "version": env!("CARGO_PKG_VERSION"),
@@ -76,6 +85,7 @@ async fn status(axum::extract::State(state): axum::extract::State<AppState>) -> 
         "indexed": status.indexed,
         "syncing": state.store.syncing(),
         "mempool": state.mempool.read().unwrap().len(),
+        "mempool_stats": mempool_stats,
         "disk_usage": usage,
     }))
 }

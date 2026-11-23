@@ -21,6 +21,7 @@ use anyhow::Result;
 use bitcoin::BlockHash;
 use bitcoin::block::Header;
 use bitcoin::hashes::Hash as _;
+use bitcoin::p2p::ServiceFlags;
 use bitcoin::p2p::message::NetworkMessage;
 use bitcoin::p2p::message_blockdata::{GetHeadersMessage, Inventory};
 use tokio::sync::mpsc;
@@ -79,8 +80,25 @@ pub struct Status {
     pub indexed: Option<u32>,
 }
 
+/// How the node and the mempool talk.
+pub struct MempoolLink {
+    pub shared: mempool::Shared,
+    /// Where transactions from peers go to be checked.
+    pub check: std::sync::mpsc::Sender<(Vec<u8>, Source)>,
+    /// Transactions sent to the API and accepted, to send to peers.
+    pub relay: mpsc::UnboundedReceiver<Vec<u8>>,
+    /// Transactions to ask peers for: orphans' parents, and those another
+    /// server's mempool has (see `mempool_bootstrap`).
+    pub wants: mpsc::UnboundedReceiver<mempool::Want>,
+}
+
+/// Transactions asked of a peer in one `getdata`, at most.
+const TX_ASK_BATCH: usize = 1000;
+
 struct Peer {
     info: PeerInfo,
+    /// Whether it's been asked for its mempool (BIP35).
+    asked_mempool: bool,
     commands: mpsc::UnboundedSender<NetworkMessage>,
     in_flight: HashSet<BlockHash>,
     /// The best height it's said or shown it has.
@@ -129,10 +147,11 @@ pub struct Node {
     avg_block: f64,
     last_upkeep: Instant,
     mempool: mempool::Shared,
-    /// Where transactions from peers go to be checked.
     mempool_tx: std::sync::mpsc::Sender<(Vec<u8>, Source)>,
-    /// Transactions sent to the API and accepted, to send to peers.
     relay: mpsc::UnboundedReceiver<Vec<u8>>,
+    wants: mpsc::UnboundedReceiver<mempool::Want>,
+    /// Wanted of any peer, while there are none.
+    wanted: Vec<crate::hash::Hash>,
     /// Those, until they're confirmed, to send again now and then.
     ours: HashMap<crate::hash::Hash, (Vec<u8>, Instant)>,
     /// Transactions asked of peers, and when.
@@ -147,10 +166,9 @@ impl Node {
         data_dir: &Path,
         writer: Writer,
         status: Arc<Mutex<Status>>,
-        mempool: mempool::Shared,
-        mempool_tx: std::sync::mpsc::Sender<(Vec<u8>, Source)>,
-        relay: mpsc::UnboundedReceiver<Vec<u8>>,
+        link: MempoolLink,
     ) -> Result<Node> {
+        let MempoolLink { shared: mempool, check: mempool_tx, relay, wants } = link;
         let store = writer.store.clone();
         let mut headers = HeaderChain::open(config.chain, &data_dir.join("headers"))?;
         // What's indexed is in the header chain, even if the file lost it.
@@ -215,6 +233,8 @@ impl Node {
             mempool,
             mempool_tx,
             relay,
+            wants,
+            wanted: Vec::new(),
             ours: HashMap::new(),
             tx_requests: HashMap::new(),
             store,
@@ -229,6 +249,7 @@ impl Node {
                 Some(event) = self.events.recv() => self.on_peer_event(event),
                 Some(event) = self.indexer.recv() => self.on_indexer_event(event)?,
                 Some(raw) = self.relay.recv() => self.broadcast(raw),
+                Some((from, txids)) = self.wants.recv() => self.fetch_txs(from, txids),
                 Some(addrs) = self.addrs.recv() => {
                     self.seeding = false;
                     for addr in addrs {
@@ -269,6 +290,7 @@ impl Node {
                     id,
                     Peer {
                         info,
+                        asked_mempool: false,
                         commands,
                         in_flight: HashSet::new(),
                         height,
@@ -346,7 +368,7 @@ impl Node {
             NetworkMessage::Tx(tx) => {
                 let txid = tx.compute_txid().to_byte_array();
                 self.tx_requests.remove(&txid);
-                let _ = self.mempool_tx.send((bitcoin::consensus::serialize(&tx), Source::Peer));
+                let _ = self.mempool_tx.send((bitcoin::consensus::serialize(&tx), Source::Peer(Some(id))));
             }
             NetworkMessage::GetData(inventory) => {
                 // Peers may ask for the transactions sent them.
@@ -489,6 +511,8 @@ impl Node {
             self.sync_headers();
             self.time_out_requests();
             self.rebroadcast();
+            self.ask_mempools();
+            self.spread_wanted();
         }
         if self.best_changed {
             self.best_changed = false;
@@ -691,8 +715,70 @@ impl Node {
             }
         }
         drop(mempool);
-        if !wanted.is_empty() {
-            self.send(id, NetworkMessage::GetData(wanted));
+        for batch in wanted.chunks(TX_ASK_BATCH) {
+            self.send(id, NetworkMessage::GetData(batch.to_vec()));
+        }
+    }
+
+    /// Whether the mempool's being kept: once the first sync is over.
+    fn keeping_mempool(&self) -> bool {
+        !self.store.syncing() && self.store.snapshot().blocks > 0
+    }
+
+    /// Asks for transactions by txid: of `from`, if it's still connected,
+    /// or spread across every peer. Peers send any in their mempool more
+    /// than a couple of minutes, announced or not.
+    fn fetch_txs(&mut self, from: Option<PeerId>, txids: Vec<crate::hash::Hash>) {
+        let mempool = self.mempool.read().unwrap();
+        let txids: Vec<crate::hash::Hash> =
+            txids.into_iter().filter(|txid| !mempool.contains(txid) && !self.tx_requests.contains_key(txid)).collect();
+        drop(mempool);
+        if let Some(from) = from.filter(|id| self.peers.contains_key(id)) {
+            for txid in &txids {
+                self.tx_requests.insert(*txid, Instant::now());
+            }
+            let inventory: Vec<Inventory> =
+                txids.iter().map(|txid| Inventory::WitnessTransaction(bitcoin::Txid::from_byte_array(*txid))).collect();
+            for batch in inventory.chunks(TX_ASK_BATCH) {
+                self.send(from, NetworkMessage::GetData(batch.to_vec()));
+            }
+            return;
+        }
+        self.wanted.extend(txids);
+        self.spread_wanted();
+    }
+
+    /// Asks the peers for what's wanted of any, a batch each in turn.
+    fn spread_wanted(&mut self) {
+        if self.peers.is_empty() || self.wanted.is_empty() {
+            return;
+        }
+        let ids: Vec<PeerId> = self.peers.keys().copied().collect();
+        let wanted = std::mem::take(&mut self.wanted);
+        tracing::debug!("asking {} peers for {} transactions", ids.len(), wanted.len());
+        for (i, batch) in wanted.chunks(TX_ASK_BATCH).enumerate() {
+            for txid in batch {
+                self.tx_requests.insert(*txid, Instant::now());
+            }
+            let inventory =
+                batch.iter().map(|txid| Inventory::WitnessTransaction(bitcoin::Txid::from_byte_array(*txid))).collect();
+            self.send(ids[i % ids.len()], NetworkMessage::GetData(inventory));
+        }
+    }
+
+    /// Asks each peer that serves bloom filters, and so BIP35's `mempool`
+    /// (others disconnect for it), for every transaction in its mempool,
+    /// once the mempool's being kept.
+    fn ask_mempools(&mut self) {
+        if !self.keeping_mempool() {
+            return;
+        }
+        for peer in self.peers.values_mut() {
+            if !peer.asked_mempool && peer.info.services.has(ServiceFlags::BLOOM) {
+                peer.asked_mempool = true;
+                tracing::debug!("asking {} for its mempool", peer.info.addr);
+                let _ = peer.commands.send(NetworkMessage::MemPool);
+            }
         }
     }
 

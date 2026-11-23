@@ -10,18 +10,25 @@
 //! default since version 28): a transaction spending what one here spends
 //! replaces it, and everything spending that, if it pays more in all, by
 //! the incremental relay fee for its size, and at a higher rate than each.
-//! Transactions whose inputs aren't known (orphans) are refused, not kept.
+//! A transaction whose inputs aren't known (an orphan) is kept aside for a
+//! while, and its missing parents asked for from the peer that sent it; it's
+//! tried again once they arrive. Peers announce only transactions new to
+//! them, so the mempool is saved to `mempool.dat` every ten minutes and when
+//! bitdexter stops, and loaded again when it starts.
 //!
 //! As blocks are committed, the transactions they confirm leave, and so do
 //! those spending what they spend, and everything spending those. If the
 //! chain reorganizes, every transaction is checked again. When it's over
 //! its size, those paying the lowest rate leave first.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use crate::block::{Tx, parse_tx};
 use crate::consensus::{self, ScriptClass};
 use crate::hash::Hash;
+use crate::p2p::PeerId;
 use crate::store::{Store, script_key};
 use crate::validate::{COINBASE_MATURITY, MAX_MONEY};
 use crate::verify::{TxCheck, verify_scripts};
@@ -119,6 +126,18 @@ pub struct Mempool {
     seq: u64,
     /// The block the transactions were last checked against.
     synced: Option<(u32, Hash)>,
+    pub stats: Stats,
+}
+
+/// What's come of the transactions offered, since bitdexter started.
+#[derive(Debug, Clone, Default)]
+pub struct Stats {
+    pub accepted: u64,
+    /// Transactions refused, by why.
+    pub refused: std::collections::BTreeMap<String, u64>,
+    /// Orphans kept aside, ever, and now.
+    pub orphaned: u64,
+    pub orphans: usize,
 }
 
 /// Seconds since 1970.
@@ -186,6 +205,23 @@ impl Mempool {
     /// Accepts a transaction, as of the chain `store` has committed.
     /// Returns its txid.
     pub fn accept(&mut self, store: &Store, raw: Vec<u8>) -> Result<Hash, Reject> {
+        self.accept_at(store, raw, now())
+    }
+
+    /// Accepts a transaction that arrived at `time`, in seconds since 1970.
+    pub fn accept_at(&mut self, store: &Store, raw: Vec<u8>, time: u64) -> Result<Hash, Reject> {
+        let result = self.check_and_insert(store, raw, time);
+        match &result {
+            Ok(_) => self.stats.accepted += 1,
+            Err(reject) => {
+                let reason = reject.reason.split(" (").next().unwrap_or_default().to_string();
+                *self.stats.refused.entry(reason).or_default() += 1;
+            }
+        }
+        result
+    }
+
+    fn check_and_insert(&mut self, store: &Store, raw: Vec<u8>, time: u64) -> Result<Hash, Reject> {
         self.sync(store);
         let tx = parse_tx(&raw).map_err(|err| Reject::new(-22, format!("TX decode failed: {err}")))?;
         let txid = tx.txid;
@@ -296,7 +332,7 @@ impl Mempool {
             fee,
             vsize,
             weight,
-            time: now(),
+            time,
             prevouts,
             outputs,
             parents,
@@ -447,15 +483,48 @@ impl Mempool {
         let mut entries: Vec<Entry> = std::mem::take(&mut self.txs).into_values().collect();
         entries.sort_unstable_by_key(|e| e.seq);
         let synced = self.synced;
-        *self = Mempool { synced, seq: self.seq, ..Mempool::default() };
+        let stats = std::mem::take(&mut self.stats);
+        *self = Mempool { synced, seq: self.seq, stats, ..Mempool::default() };
         let count = entries.len();
         let mut kept = 0;
         for entry in entries {
-            if self.accept(store, entry.raw).is_ok() {
+            if self.check_and_insert(store, entry.raw, entry.time).is_ok() {
                 kept += 1;
             }
         }
         tracing::info!("the chain changed: kept {kept} of {count} unconfirmed transactions");
+    }
+
+    /// The transactions this spends that are neither here nor in a block:
+    /// what it needs before it can be accepted.
+    pub fn missing_parents(&self, store: &Store, raw: &[u8]) -> Vec<Hash> {
+        let Ok(tx) = parse_tx(raw) else { return Vec::new() };
+        let mut missing: Vec<Hash> = tx
+            .inputs
+            .iter()
+            .map(|input| input.prev_txid)
+            .filter(|txid| !self.txs.contains_key(txid) && store.txnum(txid).is_none())
+            .collect();
+        missing.sort_unstable();
+        missing.dedup();
+        missing
+    }
+
+    /// Writes every transaction, in the order they arrived, to `path`.
+    pub fn save(&self, path: &std::path::Path) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut entries: Vec<&Entry> = self.txs.values().collect();
+        entries.sort_unstable_by_key(|e| e.seq);
+        let tmp = path.with_extension("dat.new");
+        let mut out = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
+        out.write_all(SAVED_MAGIC)?;
+        for entry in entries {
+            out.write_all(&entry.time.to_le_bytes())?;
+            out.write_all(&(entry.raw.len() as u32).to_le_bytes())?;
+            out.write_all(&entry.raw)?;
+        }
+        out.into_inner().map_err(|err| err.into_error())?.sync_all()?;
+        std::fs::rename(tmp, path)
     }
 
     /// The fee rate, in sat/vB, a transaction needs to be in about `target`
@@ -563,57 +632,352 @@ pub type Shared = std::sync::Arc<std::sync::RwLock<Mempool>>;
 
 /// Where a transaction to check came from.
 pub enum Source {
-    Peer,
+    /// A peer, which can be asked for its parents if it's an orphan.
+    Peer(Option<PeerId>),
     /// Sent to the API, which is told how it went.
     Api(tokio::sync::oneshot::Sender<Result<Hash, Reject>>),
+}
+
+/// Transactions to ask peers for: of the one given, or of any.
+pub type Want = (Option<PeerId>, Vec<Hash>);
+
+const SAVED_MAGIC: &[u8; 8] = b"BDXMEMP1";
+/// How often the mempool is saved.
+const SAVE_EVERY: Duration = Duration::from_secs(600);
+/// Orphans kept, at most, and for how long.
+const MAX_ORPHANS: usize = 5_000;
+const MAX_ORPHAN_BYTES: usize = 50 << 20;
+const MAX_ORPHAN_SIZE: usize = 100_000;
+const ORPHAN_LIFE: Duration = Duration::from_secs(20 * 60);
+
+/// The transactions saved at `path`, with when each arrived, in order.
+pub fn load(path: &std::path::Path) -> std::io::Result<Vec<(u64, Vec<u8>)>> {
+    let bytes = std::fs::read(path)?;
+    if bytes.len() < 8 || &bytes[..8] != SAVED_MAGIC {
+        return Err(std::io::Error::other("not a saved mempool"));
+    }
+    let mut txs = Vec::new();
+    let mut at = 8;
+    while at < bytes.len() {
+        let header = bytes.get(at..at + 12).ok_or_else(|| std::io::Error::other("truncated"))?;
+        let time = u64::from_le_bytes(header[..8].try_into().unwrap());
+        let len = u32::from_le_bytes(header[8..].try_into().unwrap()) as usize;
+        let raw = bytes.get(at + 12..at + 12 + len).ok_or_else(|| std::io::Error::other("truncated"))?;
+        txs.push((time, raw.to_vec()));
+        at += 12 + len;
+    }
+    Ok(txs)
+}
+
+struct Orphan {
+    raw: Vec<u8>,
+    from: Option<PeerId>,
+    added: Instant,
+    parents: Vec<Hash>,
+}
+
+/// Transactions waiting for their parents.
+#[derive(Default)]
+struct Orphans {
+    by_txid: HashMap<Hash, Orphan>,
+    by_parent: HashMap<Hash, HashSet<Hash>>,
+    /// In the order they were added, for evicting the oldest.
+    order: VecDeque<Hash>,
+    bytes: usize,
+}
+
+impl Orphans {
+    fn len(&self) -> usize {
+        self.by_txid.len()
+    }
+
+    /// Keeps a transaction until `parents` arrive. Returns whether it did.
+    fn add(&mut self, txid: Hash, raw: Vec<u8>, from: Option<PeerId>, parents: Vec<Hash>) -> bool {
+        if self.by_txid.contains_key(&txid) || raw.len() > MAX_ORPHAN_SIZE {
+            return false;
+        }
+        while self.len() >= MAX_ORPHANS || self.bytes + raw.len() > MAX_ORPHAN_BYTES {
+            let Some(oldest) = self.order.pop_front() else { break };
+            self.remove(&oldest);
+        }
+        for parent in &parents {
+            self.by_parent.entry(*parent).or_default().insert(txid);
+        }
+        self.bytes += raw.len();
+        self.order.push_back(txid);
+        self.by_txid.insert(txid, Orphan { raw, from, added: Instant::now(), parents });
+        true
+    }
+
+    fn remove(&mut self, txid: &Hash) -> Option<Orphan> {
+        let orphan = self.by_txid.remove(txid)?;
+        self.bytes -= orphan.raw.len();
+        for parent in &orphan.parents {
+            if let Some(children) = self.by_parent.get_mut(parent) {
+                children.remove(txid);
+                if children.is_empty() {
+                    self.by_parent.remove(parent);
+                }
+            }
+        }
+        Some(orphan)
+    }
+
+    /// Takes the orphans waiting on `parent`, to be tried again.
+    fn take_children(&mut self, parent: &Hash) -> Vec<Orphan> {
+        let children: Vec<Hash> = self.by_parent.get(parent).map(|c| c.iter().copied().collect()).unwrap_or_default();
+        children.iter().filter_map(|txid| self.remove(txid)).collect()
+    }
+
+    fn take_all(&mut self) -> Vec<Orphan> {
+        let txids: Vec<Hash> = self.order.drain(..).collect();
+        txids.iter().filter_map(|txid| self.remove(txid)).collect()
+    }
+
+    fn expire(&mut self) {
+        while let Some(oldest) = self.order.front() {
+            match self.by_txid.get(oldest) {
+                Some(orphan) if orphan.added.elapsed() < ORPHAN_LIFE => break,
+                _ => {
+                    let oldest = self.order.pop_front().unwrap();
+                    self.remove(&oldest);
+                }
+            }
+        }
+    }
+}
+
+/// The thread checking transactions, and what it keeps.
+struct Checker {
+    mempool: Shared,
+    store: std::sync::Arc<Store>,
+    relay: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    wants: tokio::sync::mpsc::UnboundedSender<Want>,
+    orphans: Orphans,
+}
+
+impl Checker {
+    /// Checks a transaction, and then any orphans it lets in, and theirs.
+    fn submit(&mut self, raw: Vec<u8>, source: Source, time: u64) {
+        let mut queue = vec![(raw, source, time)];
+        while let Some((raw, source, time)) = queue.pop() {
+            let mut mempool = self.mempool.write().unwrap();
+            let result = mempool.accept_at(&self.store, raw.clone(), time);
+            let from = match source {
+                Source::Api(reply) => {
+                    if result.is_ok() {
+                        let _ = self.relay.send(raw.clone());
+                    }
+                    let _ = reply.send(result.clone());
+                    None
+                }
+                Source::Peer(from) => from,
+            };
+            match result {
+                Ok(txid) => {
+                    for orphan in self.orphans.take_children(&txid) {
+                        queue.push((orphan.raw, Source::Peer(orphan.from), now()));
+                    }
+                }
+                Err(reject) if reject.code == -25 => {
+                    let parents = mempool.missing_parents(&self.store, &raw);
+                    let Ok(tx) = parse_tx(&raw) else { continue };
+                    if !parents.is_empty() && self.orphans.add(tx.txid, raw.clone(), from, parents.clone()) {
+                        mempool.stats.orphaned += 1;
+                        let _ = self.wants.send((from, parents));
+                    }
+                }
+                Err(reject) => tracing::trace!("refused a transaction: {reject}"),
+            }
+            mempool.stats.orphans = self.orphans.len();
+        }
+    }
 }
 
 /// Checks transactions as they come, one at a time, on a thread of its own,
 /// and catches the mempool up with the store every second. Returns the
 /// channel to send it transactions; those accepted from the API are passed
-/// to `relay`, to be sent to peers.
+/// to `relay`, to be sent to peers, and the parents of orphans to `wants`.
+/// If `saved` is given, the mempool's loaded from it once the store's synced,
+/// and saved to it every ten minutes.
 pub fn spawn(
     mempool: Shared,
     store: std::sync::Arc<Store>,
     relay: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    wants: tokio::sync::mpsc::UnboundedSender<Want>,
+    saved: Option<PathBuf>,
 ) -> std::sync::mpsc::Sender<(Vec<u8>, Source)> {
     let (tx, rx) = std::sync::mpsc::channel::<(Vec<u8>, Source)>();
+    let mut checker = Checker { mempool, store, relay, wants, orphans: Orphans::default() };
     std::thread::Builder::new()
         .name("mempool".into())
         .spawn(move || {
+            let mut to_load = saved.clone().filter(|path| path.exists());
+            let mut last_save = Instant::now();
+            let mut tip = None;
             loop {
-                match rx.recv_timeout(std::time::Duration::from_secs(1)) {
+                match rx.recv_timeout(Duration::from_secs(1)) {
                     Ok((raw, source)) => {
                         // Not until the first sync is over: what's spent isn't known.
-                        if store.syncing() {
+                        if checker.store.syncing() {
                             if let Source::Api(reply) = source {
                                 let _ = reply.send(Err(Reject::new(-28, "still syncing")));
                             }
                             continue;
                         }
-                        let result = mempool.write().unwrap().accept(&store, raw.clone());
-                        match source {
-                            Source::Api(reply) => {
-                                if result.is_ok() {
-                                    let _ = relay.send(raw);
-                                }
-                                let _ = reply.send(result);
-                            }
-                            Source::Peer => {
-                                if let Err(reject) = &result {
-                                    tracing::trace!("refused a transaction: {reject}");
-                                }
-                            }
-                        }
+                        checker.submit(raw, source, now());
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                 }
-                if !store.syncing() {
-                    mempool.write().unwrap().sync(&store);
+                if checker.store.syncing() {
+                    continue;
+                }
+                if let Some(path) = to_load.take() {
+                    match load(&path) {
+                        Ok(txs) => {
+                            let count = txs.len();
+                            for (time, raw) in txs {
+                                checker.submit(raw, Source::Peer(None), time);
+                            }
+                            let kept = checker.mempool.read().unwrap().len();
+                            tracing::info!("loaded {kept} of {count} saved unconfirmed transactions");
+                        }
+                        Err(err) => tracing::warn!("couldn't load {}: {err}", path.display()),
+                    }
+                }
+                checker.mempool.write().unwrap().sync(&checker.store);
+                // A new block may hold an orphan's parents.
+                let now_tip = checker.store.tip().map(|(height, record)| (height, record.hash()));
+                if now_tip != tip {
+                    tip = now_tip;
+                    for orphan in checker.orphans.take_all() {
+                        checker.submit(orphan.raw, Source::Peer(orphan.from), now());
+                    }
+                }
+                checker.orphans.expire();
+                if let Some(path) = &saved
+                    && last_save.elapsed() >= SAVE_EVERY
+                {
+                    last_save = Instant::now();
+                    if let Err(err) = checker.mempool.read().unwrap().save(path) {
+                        tracing::warn!("couldn't save the mempool: {err}");
+                    }
                 }
             }
         })
         .expect("spawning the mempool thread");
     tx
+}
+
+/// Asks the Esplora server at `url` for the txids in its mempool, once the
+/// first sync is over (and a saved mempool's had a minute to load), and
+/// passes them to `wants`, to be fetched from peers. Then again ten minutes
+/// later, for any a peer didn't have the first time.
+pub async fn bootstrap(
+    url: String,
+    store: std::sync::Arc<Store>,
+    wants: tokio::sync::mpsc::UnboundedSender<Want>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    let client = match reqwest::Client::builder()
+        .user_agent(concat!("bitdexter/", env!("CARGO_PKG_VERSION")))
+        .timeout(Duration::from_secs(60))
+        .build()
+    {
+        Ok(client) => client,
+        Err(err) => return tracing::error!("can't fetch a mempool to start from: {err}"),
+    };
+    let url = format!("{}/mempool/txids", url.trim_end_matches('/'));
+    let mut wait = Duration::from_secs(60);
+    for _ in 0..2 {
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep(wait) => {}
+                _ = shutdown.changed() => return,
+            }
+            if !store.syncing() && store.snapshot().blocks > 0 {
+                break;
+            }
+            wait = Duration::from_secs(10);
+        }
+        let txids: Result<Vec<String>, String> = async {
+            let response = client.get(&url).send().await.map_err(|e| e.to_string())?;
+            let response = response.error_for_status().map_err(|e| e.to_string())?;
+            serde_json::from_str(&response.text().await.map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+        }
+        .await;
+        match txids {
+            Ok(txids) => {
+                let txids: Vec<Hash> = txids.iter().filter_map(|txid| crate::hash::from_hex_rev(txid)).collect();
+                tracing::info!("{url} has {} unconfirmed transactions; asking peers for those missing", txids.len());
+                let _ = wants.send((None, txids));
+            }
+            Err(err) => tracing::warn!("couldn't fetch {url}: {err}"),
+        }
+        wait = Duration::from_secs(600);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn orphans_wait_for_their_parents() {
+        let mut orphans = Orphans::default();
+        let (a, b, c) = ([1; 32], [2; 32], [3; 32]);
+        assert!(orphans.add(a, vec![0; 10], Some(7), vec![b, c]));
+        assert!(!orphans.add(a, vec![0; 10], None, vec![b]));
+        assert!(!orphans.add([4; 32], vec![0; MAX_ORPHAN_SIZE + 1], None, vec![b]));
+        let children = orphans.take_children(&b);
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].from, Some(7));
+        // Taken, it no longer waits on its other parent.
+        assert!(orphans.take_children(&c).is_empty());
+        assert_eq!((orphans.len(), orphans.bytes), (0, 0));
+        // The oldest go first when it's full.
+        for n in 0..MAX_ORPHANS as u32 + 3 {
+            let mut txid = [0; 32];
+            txid[..4].copy_from_slice(&n.to_le_bytes());
+            orphans.add(txid, vec![0; 10], None, vec![b]);
+        }
+        assert_eq!(orphans.len(), MAX_ORPHANS);
+        assert!(!orphans.by_txid.contains_key(&[0; 32]));
+        assert_eq!(orphans.take_all().len(), MAX_ORPHANS);
+        assert!(orphans.by_parent.is_empty());
+    }
+
+    #[test]
+    fn saved_mempool_reads_back() {
+        let dir = std::env::temp_dir().join(format!("bitdexter-mempool-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mempool.dat");
+        let mut mempool = Mempool::default();
+        for (n, raw) in [vec![1u8, 2, 3], vec![4u8; 300]].into_iter().enumerate() {
+            mempool.seq += 1;
+            let txid = [n as u8; 32];
+            mempool.txs.insert(
+                txid,
+                Entry {
+                    txid,
+                    raw,
+                    fee: 0,
+                    vsize: 1,
+                    weight: 4,
+                    time: 1000 + n as u64,
+                    prevouts: Vec::new(),
+                    outputs: Vec::new(),
+                    parents: HashSet::new(),
+                    children: HashSet::new(),
+                    seq: mempool.seq,
+                },
+            );
+        }
+        mempool.save(&path).unwrap();
+        assert_eq!(load(&path).unwrap(), vec![(1000, vec![1, 2, 3]), (1001, vec![4; 300])]);
+        std::fs::write(&path, b"BDXMEMP1\x01").unwrap();
+        assert!(load(&path).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

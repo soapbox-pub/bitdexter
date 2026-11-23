@@ -33,6 +33,11 @@ pub struct Config {
     pub prices: bool,
     /// Where to serve the Electrum protocol, if anywhere, as `host:port`.
     pub electrum: Option<SocketAddr>,
+    /// An Esplora server whose mempool's txids are fetched once the first
+    /// sync is over, for the transactions peers never announce because they
+    /// arrived before bitdexter was listening. The transactions themselves
+    /// are fetched from peers, and checked as any are.
+    pub mempool_bootstrap: Option<String>,
     pub p2p: P2p,
 }
 
@@ -61,6 +66,7 @@ impl Default for Config {
             blindbit: false,
             prices: false,
             electrum: None,
+            mempool_bootstrap: None,
             p2p: P2p::default(),
         }
     }

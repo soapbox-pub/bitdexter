@@ -15,6 +15,7 @@ bitcoind and bitcoin-cli must be on PATH.
 
 import base64
 import hashlib
+import http.server
 import json
 import os
 import shutil
@@ -23,6 +24,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -85,6 +87,7 @@ class Dexter:
         self.core = core
         self.log = open(os.path.join(tmp, "dexter.log"), "a")
         self.proc = None
+        self.extra = []
 
     def start(self):
         self.proc = subprocess.Popen(
@@ -92,6 +95,7 @@ class Dexter:
                 BITDEXTER, "--network", "regtest", "--data-dir", self.dir, "--http", f"127.0.0.1:{self.http}",
                 "--peer", f"127.0.0.1:{self.core.p2p}", "--connect-only",
                 "--bulk-threshold", str(self.bulk_threshold), "--blockbook", "--blindbit", "--electrum", f"127.0.0.1:{self.electrum}",
+                *self.extra,
             ],
             stdout=self.log,
             stderr=self.log,
@@ -518,7 +522,83 @@ def check_electrum(core, dexter):
     print(f"  checked the Electrum protocol, {checked} scripts")
 
 
-def scenario(bulk_threshold):
+def serve_txids(txids):
+    """A stand-in for an Esplora server, with just `/mempool/txids`."""
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = json.dumps(txids).encode()
+            self.send_response(200 if self.path == "/mempool/txids" else 404)
+            self.send_header("content-type", "application/json")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
+
+
+def dexter_status(dexter):
+    try:
+        return dexter.get("/status")
+    except (urllib.error.URLError, ConnectionError):
+        return {}
+
+
+def mempool_txids(dexter):
+    try:
+        return set(dexter.get("/mempool/txids"))
+    except (urllib.error.URLError, ConnectionError):
+        return set()
+
+
+def check_mempool_fill(core, dexter):
+    """Checks that transactions sent while bitdexter was down are fetched
+    once an Esplora server lists them, a child before its parent too, and
+    that the mempool is kept across a restart."""
+    w = "w"
+    dexter.stop()
+    saved = os.path.join(dexter.dir, "regtest", "mempool.dat")
+    if os.path.exists(saved):
+        os.remove(saved)
+    to = core.cli("getnewaddress", "", "bech32", wallet=w)
+    parent = core.cli("sendtoaddress", to, "1.0", wallet=w)
+    vout = next(o["n"] for o in core.cli("getrawtransaction", parent, True)["vout"] if o["scriptPubKey"].get("address") == to)
+    dest = core.cli("getnewaddress", "", "bech32", wallet=w)
+    raw = core.cli("createrawtransaction", json.dumps([{"txid": parent, "vout": vout}]), json.dumps({dest: 0.999}))
+    child = core.cli("sendrawtransaction", core.cli("signrawtransactionwithwallet", raw, wallet=w)["hex"])
+    server = serve_txids([child, parent])
+    try:
+        dexter.extra = ["--mempool-bootstrap", f"http://127.0.0.1:{server.server_port}"]
+        dexter.start()
+        # Core sends a peer only transactions it had when it last announced
+        # one to it: give it one to announce.
+        until("bitdexter to connect", lambda: dexter_status(dexter).get("peers") == 1)
+        core.cli("sendtoaddress", core.cli("getnewaddress", "", "bech32", wallet=w), "0.1", wallet=w)
+        try:
+            until("the listed transactions", lambda: {parent, child} <= mempool_txids(dexter), timeout=180)
+        except RuntimeError:
+            print(dexter.get("/status"), parent, child)
+            raise
+    finally:
+        server.shutdown()
+        dexter.extra = []
+    stats = dexter.get("/status")["mempool_stats"]
+    assert stats["orphaned"] >= 1, stats
+    before = mempool_txids(dexter)
+    dexter.stop()
+    dexter.start()
+    until("the saved mempool", lambda: before <= mempool_txids(dexter))
+    # Mined, so the checks after start with an empty mempool.
+    core.cli("generatetoaddress", 1, core.cli("getnewaddress", "", "bech32", wallet=w))
+    until("an empty mempool", lambda: dexter.get("/mempool")["count"] == len(core.cli("getrawmempool")) == 0)
+    print(f"  checked filling the mempool: {len(before)} fetched, child first, and kept across a restart")
+
+
+def scenario(bulk_threshold, fill=False):
     tmp = tempfile.mkdtemp(prefix="bitdexter-regtest-")
     core = Core(tmp)
     dexter = Dexter(tmp, core, bulk_threshold)
@@ -532,6 +612,8 @@ def scenario(bulk_threshold):
         print("unconfirmed transactions")
         check_mempool(core, dexter)
         check(core, dexter)
+        if fill:
+            check_mempool_fill(core, dexter)
 
         print("Blockbook's API")
         check_blockbook(core, dexter)
@@ -575,7 +657,7 @@ def scenario(bulk_threshold):
 
 def main():
     print("== indexing in place")
-    scenario(1_000_000)
+    scenario(1_000_000, fill=True)
     print("== indexing in bulk")
     scenario(10)
     print("ok")

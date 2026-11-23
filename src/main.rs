@@ -54,6 +54,9 @@ struct Args {
     /// Serve the Electrum protocol here, as host:port.
     #[arg(long)]
     electrum: Option<std::net::SocketAddr>,
+    /// Fill the mempool, once synced, with what this Esplora server's has.
+    #[arg(long)]
+    mempool_bootstrap: Option<String>,
 }
 
 #[tokio::main]
@@ -92,6 +95,9 @@ async fn main() -> Result<()> {
     if args.electrum.is_some() {
         config.electrum = args.electrum;
     }
+    if args.mempool_bootstrap.is_some() {
+        config.mempool_bootstrap = args.mempool_bootstrap;
+    }
 
     let dir = config.network_dir();
     tracing::info!("bitdexter {} on {}, in {}", env!("CARGO_PKG_VERSION"), config.network, dir.display());
@@ -109,8 +115,22 @@ async fn main() -> Result<()> {
     };
     let mempool = bitdexter::mempool::Shared::default();
     let (relay_tx, relay_rx) = tokio::sync::mpsc::unbounded_channel();
-    let mempool_tx = bitdexter::mempool::spawn(mempool.clone(), store.clone(), relay_tx);
-    let node = Node::new(node_config, &dir, writer, status.clone(), mempool.clone(), mempool_tx.clone(), relay_rx)?;
+    let (wants_tx, wants_rx) = tokio::sync::mpsc::unbounded_channel();
+    let saved_mempool = dir.join("mempool.dat");
+    let mempool_tx = bitdexter::mempool::spawn(
+        mempool.clone(),
+        store.clone(),
+        relay_tx,
+        wants_tx.clone(),
+        Some(saved_mempool.clone()),
+    );
+    let link = bitdexter::node::MempoolLink {
+        shared: mempool.clone(),
+        check: mempool_tx.clone(),
+        relay: relay_rx,
+        wants: wants_rx,
+    };
+    let node = Node::new(node_config, &dir, writer, status.clone(), link)?;
 
     let (shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
     let prices = bitdexter::prices::Shared::default();
@@ -137,11 +157,26 @@ async fn main() -> Result<()> {
     }
     let api = tokio::spawn(bitdexter::api::serve(
         config.http,
-        bitdexter::api::AppState { store, status, mempool, mempool_tx, prices: prices.clone() },
+        bitdexter::api::AppState {
+            store: store.clone(),
+            status,
+            mempool: mempool.clone(),
+            mempool_tx,
+            prices: prices.clone(),
+        },
         bitdexter::api::Extras { blockbook: config.blockbook, blindbit: config.blindbit },
         shutdown.clone(),
     ));
+    if let Some(url) = config.mempool_bootstrap.clone() {
+        tokio::spawn(bitdexter::mempool::bootstrap(url, store.clone(), wants_tx, shutdown.clone()));
+    }
     node.run(shutdown).await?;
+    if !store.syncing() {
+        match mempool.read().unwrap().save(&saved_mempool) {
+            Ok(()) => tracing::info!("saved the mempool"),
+            Err(err) => tracing::warn!("couldn't save the mempool: {err}"),
+        }
+    }
     api.abort();
     Ok(())
 }

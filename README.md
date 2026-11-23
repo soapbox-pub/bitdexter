@@ -35,6 +35,7 @@ blockbook = false              # serve Blockbook's API too
 blindbit = false               # serve silent payment tweaks too
 prices = false                 # fetch prices from exchanges for /v1/prices
 # electrum = "127.0.0.1:50001"  # serve the Electrum protocol
+# mempool_bootstrap = "https://mempool.space/api"  # fill the mempool from its txids
 
 [p2p]
 peers = []                     # always kept connected, as host:port
@@ -110,15 +111,31 @@ the chain or the mempool), coinbases mature, lock times passed, sigops few
 enough, scripts verified, paying at least 0.1 sat/vB. A transaction spending
 what one in the mempool spends replaces it, and what spends it, if it pays
 more in all, by 0.1 sat/vB of its size, and at a higher rate (full RBF, as
-Bitcoin Core's default). Those whose inputs aren't known are dropped, not
-kept as orphans. `POST /tx` checks a transaction the same way and sends it to
+Bitcoin Core's default). One whose inputs aren't known yet (an orphan) is kept
+for up to 20 minutes, its missing parents asked for from the peer that sent
+it, and tried again when they arrive. `POST /tx` checks a transaction the same way and sends it to
 every peer, again every ten minutes until it's confirmed; a refusal comes as
 electrs gives bitcoind's, `sendrawtransaction RPC error: {"code":…,"message":…}`.
 
 Fee estimates come from the mempool: its transactions, highest rate first,
 fill blocks in turn, and the estimate for a target of n blocks is the lowest
-rate in the n-th, or 1 sat/vB if they don't fill that many. The mempool isn't
-saved when bitdexter stops; it fills again from what peers announce.
+rate in the n-th, or 1 sat/vB if they don't fill that many.
+
+Peers announce only transactions new to them, so a mempool started empty
+misses what was already waiting, at low fees for days or weeks. So:
+
+- It's saved to `mempool.dat` every ten minutes and when bitdexter stops, and
+  loaded, each transaction checked again, when it starts.
+- Peers that serve bloom filters are asked for their whole mempool (BIP35).
+  Most don't: Bitcoin Core's default is not to.
+- With `mempool_bootstrap = "https://mempool.space/api"` (or any Esplora
+  server; `--mempool-bootstrap`), the txids in that server's mempool are
+  fetched once the first sync is done, and again ten minutes later, and the
+  transactions themselves asked of peers, which send any they had when they
+  last announced one. The server's trusted for nothing but the list: every
+  transaction is checked as any is.
+
+`/status` counts what was accepted, refused (by reason) and kept as orphans.
 
 ## How it's stored
 
@@ -202,10 +219,9 @@ the tip, the API is up in 12 seconds. About 1.1 TB was written in all.
 At the tip, blocks, transactions, outspends, merkle proofs and addresses
 compared with mempool.space all match, busy ones too. An address's history
 takes about a second for one with tens of thousands of transactions, 13 for
-the genesis block's. The mempool is far smaller than mempool.space's (1,800
-transactions minutes after a restart against its 70,000): transactions are
-fetched only as peers announce them, so those already waiting aren't, and a
-child that arrives before its parent is dropped.
+the genesis block's. Before the mempool was saved, bootstrapped and kept
+orphans, it held 1,800 transactions minutes after a restart against
+mempool.space's 70,000, and 19,000 a day later against its 65,000.
 
 Synced from testnet4's peers to its tip, 162,719 blocks and 15 million
 transactions, in 13 minutes, merging the bulk index in 5 seconds, then
@@ -247,8 +263,7 @@ Not yet: signet's block signatures, and a minimum chain work for header sync.
 5. ~~Silent payments~~ Done.
 6. ~~Prices~~ Done.
 7. ~~A full mainnet sync measured end to end~~ Done. Faster downloads from
-   peers; filling the mempool from peers' (BIP35 `mempool`, or saving it) and
-   keeping orphans until their parents arrive.
+   peers.
 8. ~~The Electrum protocol~~ Done. Packages.
 
 ## Testing
