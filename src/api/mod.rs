@@ -4,6 +4,7 @@
 pub mod blindbit;
 pub mod blockbook;
 pub mod esplora;
+mod home;
 
 pub(crate) use esplora::{Ctx, Found, History, ScriptRef, is_script, mempool_activity};
 
@@ -109,7 +110,11 @@ pub struct Extras {
 /// Esplora's API, at the root and under `/api`, and the others asked for.
 pub fn router(state: AppState, extras: Extras) -> Router {
     let apis = esplora::router();
-    let mut router = Router::new().route("/status", get(status)).merge(apis.clone()).nest("/api", apis);
+    let mut router = Router::new()
+        .route("/", get(move |state| home::home(state, extras)))
+        .route("/status", get(status))
+        .merge(apis.clone())
+        .nest("/api", apis);
     if extras.blockbook {
         router = router.merge(blockbook::router());
     }

@@ -21,7 +21,8 @@ nix develop --command cargo build --release
 ./target/release/bitdexter --network signet
 ```
 
-The API listens on `127.0.0.1:3000`, at the root and under `/api`. Data goes in
+The API listens on `127.0.0.1:3000`, at the root and under `/api`; `/` itself
+is a page saying how far it's synced and listing the APIs. Data goes in
 `~/.local/share/bitdexter/<network>`. Settings can be given in
 `~/.config/bitdexter/bitdexter.toml`, and on the command line, which wins:
 

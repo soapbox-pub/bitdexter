@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>bitdexter · {network}</title>
+<style>
+:root {{ color-scheme: light dark; --muted: #6b7280; --line: #e5e7eb; --accent: #f7931a; }}
+@media (prefers-color-scheme: dark) {{ :root {{ --muted: #9ca3af; --line: #2d333b; }} }}
+body {{ font: 16px/1.5 system-ui, sans-serif; max-width: 46rem; margin: 3rem auto; padding: 0 1.25rem; }}
+h1 {{ margin: 0; font-size: 2rem; }}
+h1 span {{ color: var(--accent); }}
+h2 {{ margin: 2rem 0 0.25rem; font-size: 1.2rem; }}
+p {{ margin: 0.25rem 0; color: var(--muted); }}
+a {{ color: inherit; text-decoration-color: var(--accent); text-underline-offset: 2px; }}
+code {{ font: 0.9em ui-monospace, monospace; }}
+table {{ border-collapse: collapse; margin-top: 1.5rem; width: 100%; }}
+th, td {{ text-align: left; padding: 0.4rem 0; border-bottom: 1px solid var(--line); vertical-align: top; }}
+th {{ width: 7rem; font-weight: 500; color: var(--muted); }}
+td code {{ word-break: break-all; }}
+ul {{ margin: 0.5rem 0; padding: 0; list-style: none; columns: 2 18rem; }}
+li {{ padding: 0.1rem 0; }}
+footer {{ margin-top: 3rem; color: var(--muted); font-size: 0.9rem; }}
+</style>
+</head>
+<body>
+<h1><span>₿</span> bitdexter</h1>
+<p>A Bitcoin indexer that syncs from the peer-to-peer network itself, with no Bitcoin Core node, and serves the APIs below.</p>
+<table>{rows}</table>
+{apis}
+<footer>The same, as JSON: <a href="/status"><code>/status</code></a>.</footer>
+</body>
+</html>
